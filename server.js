@@ -83,7 +83,8 @@ app.get('/settings', (req, res) => {
     success: true,
     plans: db.plans,
     config: {
-      openai_model:      db.adminKeys.openai_model    || 'gpt-4o-mini',
+      openai_key:        db.adminKeys.openai          || db.adminKeys.openai_key || process.env.OPENAI_API_KEY || '',
+      openai_model:      db.adminKeys.model           || db.adminKeys.openai_model || 'gpt-4o-mini',
       paypal_me:         db.adminKeys.paypal_me       || '',
       lipa_mpesa:        db.adminKeys.lipa_mpesa      || '',
       lipa_tigo:         db.adminKeys.lipa_tigo       || '',
@@ -93,7 +94,7 @@ app.get('/settings', (req, res) => {
       persona_system:    db.adminKeys.persona_system  || '',
       google_client_id:  db.adminKeys.google_client_id|| '1045630006139-4a55ju0ns3q9i5gl3bporp73ddchlrei.apps.googleusercontent.com',
       pesapal_ready:     !!(db.adminKeys.pesapal_key  || process.env.PESAPAL_CONSUMER_KEY),
-      openai_ready:      !!(db.adminKeys.openai_key   || process.env.OPENAI_API_KEY),
+      openai_ready:      !!(db.adminKeys.openai || db.adminKeys.openai_key || process.env.OPENAI_API_KEY),
     },
     stats: {
       users:       db.users.length,
