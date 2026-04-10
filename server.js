@@ -142,14 +142,35 @@ app.use(generalLimit);
 // ROUTES
 // ══════════════════════════════════════════════════════════════
 
-// Health check
-app.get('/', async (req, res) => {
+// ── STATIC FILES — serve index.html and assets ────────────────
+const path = require('path');
+const fs   = require('fs');
+
+// Serve index.html at root (and for any unknown GET routes so the SPA works)
+app.get('/', (req, res) => {
+  const htmlFile = path.join(__dirname, 'index.html');
+  if (fs.existsSync(htmlFile)) {
+    res.sendFile(htmlFile);
+  } else {
+    res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0a0f1e;color:#fff">
+      <h2>✅ Melisa AI Server is running</h2>
+      <p>Place <b>index.html</b> in the same folder as server.js to serve the app.</p>
+      <p style="color:rgba(255,255,255,.4);font-size:13px">Server v4.0 · MongoDB: ${db?'✓ Connected':'✗ Not connected'}</p>
+    </body></html>`);
+  }
+});
+
+// Serve any other static files (images, icons, etc.) from same directory
+app.use(express.static(__dirname, { index: false, dotfiles: 'ignore' }));
+
+// Health check API endpoint
+app.get('/health', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '✓ Melisa AI Server v4.0 — MongoDB Edition',
-    secure:  true,
+    status:  '✓ Melisa AI Server v4.0',
     db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
-    pesapal: c.key ? '✓ Configured' : '✗ Not configured'
+    pesapal: c.key ? '✓ Configured' : '✗ Not configured',
+    openai:  process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set'
   });
 });
 
@@ -221,7 +242,14 @@ app.post('/api/chat', aiLimit, async (req, res) => {
     const preferredModel = model || doc.adminKeys.model || 'gpt-4o-mini';
     // Fallback chain: if preferred model fails, try these in order
     const FALLBACK_MODELS = ['gpt-4o-mini', 'gpt-3.5-turbo'];
-    const modelsToTry = [preferredModel, ...FALLBACK_MODELS.filter(m => m !== preferredModel)];
+
+    // Check if any message contains image content — needs vision-capable model
+    const hasVision = messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'));
+    // Force gpt-4o for vision; gpt-3.5-turbo can't do images
+    const visionModel = hasVision ? 'gpt-4o' : preferredModel;
+    const modelsToTry = hasVision
+      ? ['gpt-4o', 'gpt-4o-mini']
+      : [preferredModel, ...FALLBACK_MODELS.filter(m => m !== preferredModel)];
 
     // Core identity — always prepended so Melisa never forgets who made her
     const MELISA_CORE = `You are Melisa — a unique, powerful AI assistant built entirely by Benedict Zagamba, a 19-year-old developer from Tanzania, in 2026.
