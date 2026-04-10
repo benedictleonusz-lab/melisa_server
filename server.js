@@ -238,12 +238,19 @@ IDENTITY RULES (absolute, no exceptions):
 
     const messagesPayload = [
       { role: 'system', content: sysProm },
-      ...messages.slice(-20).map(m => ({
-        role:    m.role === 'user' ? 'user' : 'assistant',
-        content: sanitize(m.content, 4000)
+      ...messages.slice(-10).map(m => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        // Content can be a string OR an array (vision messages with image_url)
+        content: Array.isArray(m.content)
+          ? m.content.map(part => {
+              if (part.type === 'text')      return { type: 'text', text: sanitize(part.text || '', 2000) };
+              if (part.type === 'image_url') return { type: 'image_url', image_url: { url: part.image_url?.url || '' } };
+              return part;
+            })
+          : sanitize(m.content, 4000)
       }))
     ];
-    const maxTokens = Math.min(parseInt(max_tokens) || 1200, 4000);
+    const maxTokens = Math.min(parseInt(max_tokens) || 900, 4000);
 
     let lastErr = '';
     for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
@@ -393,7 +400,34 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
   }
 });
 
-// Admin: get users
+// Image generation via DALL-E
+app.post('/api/image', aiLimit, async (req, res) => {
+  try {
+    const { prompt, size } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
+
+    const safePrompt = sanitize(prompt, 1000);
+    const safeSize   = ['1024x1024', '512x512', '256x256'].includes(size) ? size : '1024x1024';
+
+    const r = await fetch('https://api.openai.com/v1/images/generations', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({ model: 'dall-e-3', prompt: safePrompt, n: 1, size: safeSize, response_format: 'url' })
+    });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image generation failed' });
+    res.json({ success: true, url: d.data[0].url, revised_prompt: d.data[0].revised_prompt });
+  } catch (e) {
+    console.error('Image gen error:', e.message);
+    res.status(500).json({ error: 'Image generation failed: ' + e.message });
+  }
+});
+
+
 app.post('/admin/users', adminLimit, async (req, res) => {
   try {
     const { password } = req.body;
@@ -600,10 +634,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-// Keep-alive ping
+// Keep-alive ping — every 90s to prevent Render free-tier sleep
 setInterval(() => {
   fetch(SERVER_URL + '/ping').catch(() => {});
-}, 4 * 60 * 1000);
+}, 90 * 1000);
 
 // Start — connect DB first then listen
 connectDB().then(() => {
