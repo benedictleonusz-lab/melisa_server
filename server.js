@@ -278,61 +278,67 @@ app.post('/admin/plans', adminLimit, async (req, res) => {
 // Voice transcription via OpenAI Whisper — works for iOS PWA + Android
 app.post('/api/transcribe', aiLimit, async (req, res) => {
   try {
-    const { audio, mimeType } = req.body;
+    const { audio, mimeType, size } = req.body;
     if (!audio) return res.status(400).json({ error: 'No audio data' });
 
     const doc    = await getCfgDoc();
     const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
     if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
 
-    const buffer = Buffer.from(audio, 'base64');
-    // Determine file extension from mime type
-    const ext = (mimeType || '').includes('mp4') ? 'mp4'
+    const audioBuf = Buffer.from(audio, 'base64');
+    if (audioBuf.length < 500) return res.json({ success: true, text: '' }); // too short
+
+    // File extension from MIME type
+    const ext = (mimeType || '').includes('mp4') ? 'm4a'
               : (mimeType || '').includes('ogg')  ? 'ogg'
               : 'webm';
+    const contentType = mimeType || 'audio/webm';
 
-    // Build multipart form manually (no extra deps needed)
-    const boundary = '----MelisaAudio' + Date.now();
-    const CRLF     = '\r\n';
-    const header   =
-      '--' + boundary + CRLF +
-      'Content-Disposition: form-data; name="model"' + CRLF + CRLF +
-      'whisper-1' + CRLF +
-      '--' + boundary + CRLF +
-      'Content-Disposition: form-data; name="language"' + CRLF + CRLF +
-      'en' + CRLF +
-      '--' + boundary + CRLF +
-      'Content-Disposition: form-data; name="file"; filename="audio.' + ext + '"' + CRLF +
-      'Content-Type: ' + (mimeType || 'audio/webm') + CRLF + CRLF;
-    const footer   = CRLF + '--' + boundary + '--' + CRLF;
+    // Build multipart/form-data manually — no extra packages needed
+    const boundary = 'MelisaBoundary' + Date.now().toString(16);
+    const nl = '\r\n';
 
-    const body = Buffer.concat([
-      Buffer.from(header, 'utf8'),
-      buffer,
-      Buffer.from(footer, 'utf8')
-    ]);
+    const parts = [
+      // field: model
+      Buffer.from('--' + boundary + nl +
+        'Content-Disposition: form-data; name="model"' + nl + nl +
+        'whisper-1' + nl),
+      // field: response_format
+      Buffer.from('--' + boundary + nl +
+        'Content-Disposition: form-data; name="response_format"' + nl + nl +
+        'json' + nl),
+      // field: file (binary)
+      Buffer.from('--' + boundary + nl +
+        'Content-Disposition: form-data; name="file"; filename="audio.' + ext + '"' + nl +
+        'Content-Type: ' + contentType + nl + nl),
+      audioBuf,
+      Buffer.from(nl + '--' + boundary + '--' + nl)
+    ];
+
+    const body = Buffer.concat(parts);
 
     const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method:  'POST',
       headers: {
         'Authorization': 'Bearer ' + apiKey,
-        'Content-Type':  'multipart/form-data; boundary=' + boundary,
-        'Content-Length': String(body.length)
+        'Content-Type':  'multipart/form-data; boundary=' + boundary
       },
       body
     });
 
+    const raw = await whisperRes.text();
     if (!whisperRes.ok) {
-      const e = await whisperRes.json();
-      return res.status(400).json({ error: e.error?.message || 'Whisper failed' });
+      console.error('Whisper error:', raw);
+      return res.status(400).json({ error: 'Whisper failed: ' + raw.slice(0, 200) });
     }
 
-    const data = await whisperRes.json();
-    console.log('🎙 Transcribed:', (data.text || '').slice(0, 60));
-    res.json({ success: true, text: data.text || '' });
+    let text = '';
+    try { text = JSON.parse(raw).text || ''; } catch(e) { text = raw; }
+    console.log('🎙 Transcribed (' + audioBuf.length + 'B):', text.slice(0, 80));
+    res.json({ success: true, text });
   } catch (e) {
     console.error('Transcribe error:', e.message);
-    res.status(500).json({ error: 'Transcription failed' });
+    res.status(500).json({ error: 'Transcription failed: ' + e.message });
   }
 });
 
