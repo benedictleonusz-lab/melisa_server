@@ -6,6 +6,7 @@
 // ✅ Helmet security headers
 // ✅ CORS locked to your app domain only
 // ✅ Input validation & sanitization
+// ✅ Admin password verified via SHA-256 hash
 // ✅ Keep-alive ping so Render never sleeps
 // ═══════════════════════════════════════════════════════════════
 
@@ -16,13 +17,14 @@ const fs         = require('fs');
 const path       = require('path');
 const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
-const bcrypt     = require('bcrypt');
+const crypto     = require('crypto'); // built-in — no install needed
 
 const app = express();
 
 // ── ENV VARIABLES (set these in Render → Environment) ─────────
 // Required:
-//   ADMIN_PASS              → your secret admin password
+//   ADMIN_PASS_HASH         → SHA-256 hash of your admin password
+//                             Generate: node -e "const c=require('crypto');console.log(c.createHash('sha256').update('YOUR_PASSWORD').digest('hex'))"
 //   OPENAI_API_KEY          → your OpenAI key
 //   PESAPAL_CONSUMER_KEY    → Pesapal key
 //   PESAPAL_CONSUMER_SECRET → Pesapal secret
@@ -32,27 +34,24 @@ const app = express();
 //   PESAPAL_ENV             → 'live' or 'sandbox' (default: live)
 //   PORT                    → auto-set by Render
 
-// ── ADMIN PASSWORD — bcrypt hash (cannot be reversed) ─────────
-// Original password is never stored — only this hash exists in code
-const ADMIN_HASH     = '$2b$12$0dn60G2.4gRjZwzkpGcNCuCDbJoOJlB6FtObTNSbK6ZxRxOehmcN2';
+const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH || '';
+const APP_URL         = process.env.APP_URL          || '';
+const ALLOWED_ORIGIN  = process.env.ALLOWED_ORIGIN   || APP_URL || '*';
 
-const APP_URL        = process.env.APP_URL         || '';
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN  || APP_URL || '*';
-
+// ── SECURITY: warn if secrets are missing ─────────────────────
+if (!ADMIN_PASS_HASH) console.warn('⚠️  WARNING: ADMIN_PASS_HASH env var not set!');
 if (!process.env.OPENAI_API_KEY) console.warn('⚠️  WARNING: OPENAI_API_KEY env var not set!');
 
 // ── HELMET — security headers ──────────────────────────────────
 app.use(helmet({
-  contentSecurityPolicy: false, // disabled so Cloudflare frontend can work
+  contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
 }));
 
 // ── CORS — only allow your app domain ─────────────────────────
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, Render health checks)
     if (!origin) return callback(null, true);
-    // Allow your app domain
     if (
       ALLOWED_ORIGIN === '*' ||
       origin === ALLOWED_ORIGIN ||
@@ -75,7 +74,6 @@ app.use(express.json({ limit: '50kb' }));
 
 // ── RATE LIMITERS ──────────────────────────────────────────────
 
-// General API: 100 requests per minute per IP
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
@@ -84,7 +82,6 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Admin routes: 10 attempts per 15 minutes per IP (brute force protection)
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -93,7 +90,6 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// AI proxy: 30 requests per minute per IP (prevent API key abuse)
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
@@ -102,7 +98,6 @@ const aiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Payment: 10 per 10 minutes per IP
 const paymentLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 10,
@@ -138,10 +133,13 @@ function writeDB(data) {
   catch(e) { console.error('DB write error:', e.message); return false; }
 }
 
-// ── ADMIN PASSWORD CHECK — bcrypt (hash cannot be reversed) ───
-async function checkAdminPass(password) {
-  if (!password) return false;
-  return bcrypt.compare(password, ADMIN_HASH);
+// ── ADMIN PASSWORD CHECK (SHA-256 hashed) ─────────────────────
+// Set ADMIN_PASS_HASH in Render env to the SHA-256 hex of your password.
+// To generate: node -e "const c=require('crypto');console.log(c.createHash('sha256').update('YOUR_PASSWORD').digest('hex'))"
+function checkAdminPass(password) {
+  if (!ADMIN_PASS_HASH || typeof password !== 'string') return false;
+  const hash = crypto.createHash('sha256').update(password).digest('hex');
+  return hash === ADMIN_PASS_HASH;
 }
 
 // ── SANITIZE input strings ─────────────────────────────────────
@@ -191,7 +189,6 @@ async function registerIPN(token, cfg) {
 // ROUTES
 // ══════════════════════════════════════════════════════════════
 
-// ── Health check (safe — no secrets) ─────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: '✓ Melisa AI Server v3.0 running',
@@ -200,18 +197,14 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── Keep-alive ping ───────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ pong: true, time: Date.now() }));
 
-// ── GET settings ─────────────────────────────────────────────
-// ✅ SAFE: OpenAI key is NEVER sent — only non-secret config
 app.get('/settings', (req, res) => {
   const db = readDB();
   res.json({
     success: true,
     plans: db.plans,
     config: {
-      // ✅ Key is NOT included — AI calls are proxied through /api/chat
       openai_model:     db.adminKeys.model           || process.env.OPENAI_MODEL  || 'gpt-4o-mini',
       paypal_me:        db.adminKeys.paypal_me        || '',
       lipa_mpesa:       db.adminKeys.lipa_mpesa       || '',
@@ -235,8 +228,7 @@ app.get('/settings', (req, res) => {
   });
 });
 
-// ── 🤖 AI PROXY — OpenAI key NEVER leaves the server ─────────
-// The browser calls /api/chat instead of OpenAI directly
+// ── 🤖 AI PROXY — OpenAI key NEVER leaves the server ──────────
 app.post('/api/chat', aiLimiter, async (req, res) => {
   try {
     const { messages, system, model, stream, max_tokens } = req.body;
@@ -279,7 +271,6 @@ app.post('/api/chat', aiLimiter, async (req, res) => {
     }
 
     if (stream) {
-      // Stream the response directly to the client
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       openaiRes.body.pipe(res);
@@ -294,9 +285,9 @@ app.post('/api/chat', aiLimiter, async (req, res) => {
 });
 
 // ── SAVE admin settings ────────────────────────────────────────
-app.post('/admin/settings', adminLimiter, async (req, res) => {
+app.post('/admin/settings', adminLimiter, (req, res) => {
   const { password, settings } = req.body;
-  if (!(await checkAdminPass(password))) {
+  if (!checkAdminPass(password)) {
     console.warn(`🚫 Failed admin login attempt from ${req.ip}`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -304,7 +295,6 @@ app.post('/admin/settings', adminLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid settings' });
   }
   const db = readDB();
-  // Sanitize all values before saving
   const clean = {};
   for (const [k, v] of Object.entries(settings)) {
     if (typeof v === 'string') clean[sanitize(k, 50)] = sanitize(v, 1000);
@@ -315,9 +305,9 @@ app.post('/admin/settings', adminLimiter, async (req, res) => {
 });
 
 // ── SAVE plan prices ───────────────────────────────────────────
-app.post('/admin/plans', adminLimiter, async (req, res) => {
+app.post('/admin/plans', adminLimiter, (req, res) => {
   const { password, plans } = req.body;
-  if (!(await checkAdminPass(password))) return res.status(401).json({ error: 'Unauthorized' });
+  if (!checkAdminPass(password)) return res.status(401).json({ error: 'Unauthorized' });
   if (!plans || typeof plans !== 'object') return res.status(400).json({ error: 'Invalid plans' });
   const db = readDB();
   db.plans = { ...db.plans, ...plans };
@@ -326,27 +316,26 @@ app.post('/admin/plans', adminLimiter, async (req, res) => {
 });
 
 // ── ADMIN: get all users ───────────────────────────────────────
-app.post('/admin/users', adminLimiter, async (req, res) => {
+app.post('/admin/users', adminLimiter, (req, res) => {
   const { password } = req.body;
-  if (!(await checkAdminPass(password))) return res.status(401).json({ error: 'Unauthorized' });
+  if (!checkAdminPass(password)) return res.status(401).json({ error: 'Unauthorized' });
   const db = readDB();
-  // Strip passwords before sending
   const safe = db.users.map(({ password: _p, ...u }) => u);
   res.json({ success: true, users: safe });
 });
 
 // ── ADMIN: get transactions ────────────────────────────────────
-app.post('/admin/transactions', adminLimiter, async (req, res) => {
+app.post('/admin/transactions', adminLimiter, (req, res) => {
   const { password } = req.body;
-  if (!(await checkAdminPass(password))) return res.status(401).json({ error: 'Unauthorized' });
+  if (!checkAdminPass(password)) return res.status(401).json({ error: 'Unauthorized' });
   const db = readDB();
   res.json({ success: true, transactions: db.transactions });
 });
 
 // ── ADMIN: clear revenue ───────────────────────────────────────
-app.post('/admin/clear-revenue', adminLimiter, async (req, res) => {
+app.post('/admin/clear-revenue', adminLimiter, (req, res) => {
   const { password } = req.body;
-  if (!(await checkAdminPass(password))) return res.status(401).json({ error: 'Unauthorized' });
+  if (!checkAdminPass(password)) return res.status(401).json({ error: 'Unauthorized' });
   const db = readDB();
   db.transactions = [];
   writeDB(db);
@@ -362,7 +351,6 @@ app.post('/user/sync', (req, res) => {
   const email = sanitize(user.email, 200);
   const db = readDB();
   const idx = db.users.findIndex(u => u.email === email);
-  // Only sync safe fields — never accept password changes from client
   const safe = {
     id:          sanitize(user.id || '', 50),
     name:        sanitize(user.name || '', 100),
@@ -375,7 +363,6 @@ app.post('/user/sync', (req, res) => {
     lastSeen:    Date.now(),
   };
   if (idx >= 0) {
-    // Keep existing password hash, only update safe fields
     db.users[idx] = { ...db.users[idx], ...safe };
   } else {
     db.users.push(safe);
@@ -389,7 +376,6 @@ app.get('/user/:email', (req, res) => {
   const db = readDB();
   const user = db.users.find(u => u.email === decodeURIComponent(req.params.email));
   if (!user) return res.status(404).json({ error: 'Not found' });
-  // Never return the password hash
   const { password: _p, ...safe } = user;
   res.json({ success: true, user: safe });
 });
@@ -412,13 +398,13 @@ app.post('/create-payment', paymentLimiter, async (req, res) => {
     const { token, cfg } = await getToken();
     const notifId = await registerIPN(token, cfg);
     const ref = sanitize(reference || 'MELISA_' + Date.now(), 60);
-    const safeAmount = parseFloat(amount);
-    const safePlan = sanitize(plan || '', 30);
+    const safeAmount   = parseFloat(amount);
+    const safePlan     = sanitize(plan || '', 30);
     const safeDuration = sanitize(duration || 'monthly', 20);
-    const safeEmail = sanitize(email, 200);
-    const safePhone = sanitize(phone || '', 20);
-    const safeFirst = sanitize(firstName || 'Customer', 50);
-    const safeLast  = sanitize(lastName  || 'User', 50);
+    const safeEmail    = sanitize(email, 200);
+    const safePhone    = sanitize(phone || '', 20);
+    const safeFirst    = sanitize(firstName || 'Customer', 50);
+    const safeLast     = sanitize(lastName  || 'User', 50);
 
     const orderRes = await fetch(
       `${base(cfg.env)}/api/Transactions/SubmitOrderRequest`,
@@ -538,19 +524,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── Keep-alive self-ping (prevents Render free tier sleeping) ──
+// ── Keep-alive self-ping ───────────────────────────────────────
 const SERVER_URL = process.env.APP_SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
 setInterval(() => {
   fetch(`${SERVER_URL}/ping`)
     .then(() => console.log('💓 Keep-alive ping sent'))
-    .catch(() => {}); // silent fail
-}, 4 * 60 * 1000); // every 4 minutes
+    .catch(() => {});
+}, 4 * 60 * 1000);
 
 // ── START ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🚀 Melisa Server v3.0 SECURE — port ${PORT}`);
-  console.log(`🔒 Admin pass:  ${ADMIN_PASS ? '✓ Set via env' : '✗ NOT SET — set ADMIN_PASS in Render!'}`);
+  console.log(`🔒 Admin pass:  ${ADMIN_PASS_HASH ? '✓ Hash set via env' : '✗ NOT SET — set ADMIN_PASS_HASH in Render!'}`);
   console.log(`🤖 OpenAI:      ${process.env.OPENAI_API_KEY ? '✓ Set via env' : '✗ NOT SET'}`);
   console.log(`💳 Pesapal:     ${getCfg().key ? '✓ Configured' : '✗ Not configured'}`);
   console.log(`🌐 CORS origin: ${ALLOWED_ORIGIN}\n`);
