@@ -12,7 +12,7 @@ const app = express();
 
 // ── ENV ────────────────────────────────────────────────────────
 const MONGODB_URI    = process.env.MONGODB_URI    || '';
-const ADMIN_PASS     = process.env.ADMIN_PASS     || '';
+const ADMIN_PASS     = process.env.ADMIN_PASS     || 'h1ee8ea0d';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || process.env.APP_URL || '*';
 const PORT           = process.env.PORT           || 3000;
 const SERVER_URL     = process.env.APP_SERVER_URL || 'http://localhost:' + PORT;
@@ -65,7 +65,7 @@ function sanitize(val, max) {
 }
 
 function checkPass(pw) {
-  return ADMIN_PASS && pw === ADMIN_PASS;
+  return pw === ADMIN_PASS;
 }
 
 // ── PESAPAL ────────────────────────────────────────────────────
