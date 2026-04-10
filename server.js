@@ -178,7 +178,8 @@ app.get('/settings', async (req, res) => {
         persona_system:   k.persona_system   || '',
         google_client_id: k.google_client_id || '',
         pesapal_ready:    !!(k.pesapal_key   || process.env.PESAPAL_CONSUMER_KEY),
-        openai_ready:     !!(k.openai        || process.env.OPENAI_API_KEY)
+        openai_ready:     !!(k.openai        || process.env.OPENAI_API_KEY),
+        msgLimits:        k.msgLimits ? (typeof k.msgLimits==='string' ? JSON.parse(k.msgLimits) : k.msgLimits) : null
       },
       stats: { users: userCount, transactions: txList.length, revenue: revenue.toFixed(2) }
     });
