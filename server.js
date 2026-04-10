@@ -275,6 +275,67 @@ app.post('/admin/plans', adminLimit, async (req, res) => {
   }
 });
 
+// Voice transcription via OpenAI Whisper — works for iOS PWA + Android
+app.post('/api/transcribe', aiLimit, async (req, res) => {
+  try {
+    const { audio, mimeType } = req.body;
+    if (!audio) return res.status(400).json({ error: 'No audio data' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
+
+    const buffer = Buffer.from(audio, 'base64');
+    // Determine file extension from mime type
+    const ext = (mimeType || '').includes('mp4') ? 'mp4'
+              : (mimeType || '').includes('ogg')  ? 'ogg'
+              : 'webm';
+
+    // Build multipart form manually (no extra deps needed)
+    const boundary = '----MelisaAudio' + Date.now();
+    const CRLF     = '\r\n';
+    const header   =
+      '--' + boundary + CRLF +
+      'Content-Disposition: form-data; name="model"' + CRLF + CRLF +
+      'whisper-1' + CRLF +
+      '--' + boundary + CRLF +
+      'Content-Disposition: form-data; name="language"' + CRLF + CRLF +
+      'en' + CRLF +
+      '--' + boundary + CRLF +
+      'Content-Disposition: form-data; name="file"; filename="audio.' + ext + '"' + CRLF +
+      'Content-Type: ' + (mimeType || 'audio/webm') + CRLF + CRLF;
+    const footer   = CRLF + '--' + boundary + '--' + CRLF;
+
+    const body = Buffer.concat([
+      Buffer.from(header, 'utf8'),
+      buffer,
+      Buffer.from(footer, 'utf8')
+    ]);
+
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method:  'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type':  'multipart/form-data; boundary=' + boundary,
+        'Content-Length': String(body.length)
+      },
+      body
+    });
+
+    if (!whisperRes.ok) {
+      const e = await whisperRes.json();
+      return res.status(400).json({ error: e.error?.message || 'Whisper failed' });
+    }
+
+    const data = await whisperRes.json();
+    console.log('🎙 Transcribed:', (data.text || '').slice(0, 60));
+    res.json({ success: true, text: data.text || '' });
+  } catch (e) {
+    console.error('Transcribe error:', e.message);
+    res.status(500).json({ error: 'Transcription failed' });
+  }
+});
+
 // Admin: get users
 app.post('/admin/users', adminLimit, async (req, res) => {
   try {
