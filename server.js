@@ -188,6 +188,26 @@ app.get('/settings', async (req, res) => {
 });
 
 // AI proxy — OpenAI key never sent to browser
+// Helper: call OpenAI with one specific model, returns {ok, data, status, errMsg}
+async function callOpenAI(apiKey, model, messagesPayload, maxTokens, stream) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+    body: JSON.stringify({
+      model,
+      messages:   messagesPayload,
+      max_tokens: maxTokens,
+      stream:     stream === true
+    })
+  });
+  if (!res.ok) {
+    let errMsg = 'OpenAI error ' + res.status;
+    try { const e = await res.json(); errMsg = e.error?.message || errMsg; } catch {}
+    return { ok: false, status: res.status, errMsg };
+  }
+  return { ok: true, res };
+}
+
 app.post('/api/chat', aiLimit, async (req, res) => {
   try {
     const { messages, system, model, stream, max_tokens } = req.body;
@@ -195,46 +215,64 @@ app.post('/api/chat', aiLimit, async (req, res) => {
 
     const doc    = await getCfgDoc();
     const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'AI not configured. Contact admin.' });
+    if (!apiKey) return res.status(503).json({ error: 'Melisa AI is not configured yet. Please contact the admin.' });
 
-    const aiModel = model || doc.adminKeys.model || 'gpt-4o-mini';
+    const preferredModel = model || doc.adminKeys.model || 'gpt-4o-mini';
+    // Fallback chain: if preferred model fails, try these in order
+    const FALLBACK_MODELS = ['gpt-4o-mini', 'gpt-3.5-turbo'];
+    const modelsToTry = [preferredModel, ...FALLBACK_MODELS.filter(m => m !== preferredModel)];
+
     const sysProm = sanitize(system || 'You are Melisa, a helpful AI.', 2000);
+    const messagesPayload = [
+      { role: 'system', content: sysProm },
+      ...messages.slice(-20).map(m => ({
+        role:    m.role === 'user' ? 'user' : 'assistant',
+        content: sanitize(m.content, 4000)
+      }))
+    ];
+    const maxTokens = Math.min(parseInt(max_tokens) || 1200, 4000);
 
-    const payload = {
-      model: aiModel,
-      messages: [
-        { role: 'system', content: sysProm },
-        ...messages.slice(-20).map(m => ({
-          role: m.role === 'user' ? 'user' : 'assistant',
-          content: sanitize(m.content, 4000)
-        }))
-      ],
-      max_tokens: Math.min(parseInt(max_tokens) || 1200, 4000),
-      stream: stream === true
-    };
+    let lastErr = '';
+    for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
+      const tryModel = modelsToTry[attempt];
+      if (attempt > 0) {
+        console.log(`⚡ Retrying with fallback model: ${tryModel}`);
+        await new Promise(r => setTimeout(r, 600)); // brief pause before retry
+      }
 
-    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-      body: JSON.stringify(payload)
-    });
+      const result = await callOpenAI(apiKey, tryModel, messagesPayload, maxTokens, stream);
 
-    if (!openaiRes.ok) {
-      const e = await openaiRes.json();
-      return res.status(openaiRes.status).json({ error: e.error && e.error.message || 'OpenAI error' });
+      if (!result.ok) {
+        lastErr = result.errMsg;
+        const status = result.status;
+        // Don't retry on auth/billing errors — fail fast with a friendly message
+        if (status === 401) return res.status(401).json({ error: 'Invalid OpenAI API key. Please update it in the admin panel.' });
+        if (status === 429) return res.status(429).json({ error: 'Too many requests. Please wait a moment and try again.' });
+        if (status === 402) return res.status(402).json({ error: 'OpenAI account has no credits. Please top up at platform.openai.com.' });
+        // 500/503 from OpenAI — try next model
+        console.warn(`OpenAI ${status} on model ${tryModel}: ${lastErr}`);
+        continue;
+      }
+
+      // Success
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        result.res.body.pipe(res);
+      } else {
+        const data = await result.res.json();
+        res.json({ success: true, content: data.choices[0].message.content });
+      }
+      return;
     }
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      openaiRes.body.pipe(res);
-    } else {
-      const data = await openaiRes.json();
-      res.json({ success: true, content: data.choices[0].message.content });
-    }
+    // All models failed
+    console.error('All AI models failed. Last error:', lastErr);
+    res.status(503).json({ error: 'Melisa is having trouble right now. Please try again in a moment.' });
+
   } catch (e) {
     console.error('AI error:', e.message);
-    res.status(500).json({ error: 'AI request failed' });
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
