@@ -33,6 +33,7 @@ async function connectDB() {
     // indexes
     await db.collection('users').createIndex({ email: 1 }, { unique: true });
     await db.collection('transactions').createIndex({ ref: 1 });
+    await db.collection('sessions').createIndex({ email: 1 }, { unique: true });
 
     // seed default config if missing
     const exists = await db.collection('config').findOne({ _id: 'settings' });
@@ -620,9 +621,101 @@ app.get('/pesapal-webhook', async (req, res) => {
   res.redirect(c.appUrl + '?payment=success&ref=' + OrderMerchantReference + '&plan=' + plan + '&tracking=' + OrderTrackingId);
 });
 
+// Live news — fetch real RSS headlines server-side (no CORS issues)
+app.get('/api/news', async (req, res) => {
+  const feeds = [
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://feeds.bbci.co.uk/news/technology/rss.xml',
+    'https://feeds.bbci.co.uk/news/business/rss.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://feeds.reuters.com/reuters/topNews',
+    'https://feeds.reuters.com/reuters/technologyNews',
+  ];
+
+  // Try each feed until one works
+  for (const feedUrl of feeds.sort(() => Math.random() - 0.5)) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const r = await fetch(feedUrl, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/1.0)' }
+      });
+      clearTimeout(timeout);
+      if (!r.ok) continue;
+
+      const xml = await r.text();
+      // Parse <item> titles from RSS XML
+      const titles = [];
+      const titleRe = /<item[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
+      let m;
+      while ((m = titleRe.exec(xml)) !== null && titles.length < 10) {
+        const t = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+        if (t && t.length > 10) titles.push(t);
+      }
+
+      if (titles.length > 0) {
+        const headline = titles[Math.floor(Math.random() * Math.min(titles.length, 5))];
+        return res.json({ success: true, headline, source: feedUrl.includes('bbc') ? 'BBC' : 'Reuters' });
+      }
+    } catch (e) {
+      continue; // try next feed
+    }
+  }
+
+  res.json({ success: false, headline: 'Live news temporarily unavailable' });
+});
+
 // AzamPay endpoint
 app.post('/azampay', async (req, res) => {
   res.status(503).json({ error: 'AzamPay not yet configured on this server' });
+});
+
+// ── SESSION STORAGE (permanent per Google account) ──────────────
+app.post('/sessions/save', async (req, res) => {
+  try {
+    const { userId, email, sessions } = req.body;
+    if (!email || !Array.isArray(sessions)) return res.status(400).json({ error: 'Invalid data' });
+    if (!db) return res.json({ success: true }); // no DB, silently ignore
+
+    const safeEmail = sanitize(email, 200);
+    // Store up to 100 sessions per user — strip large content to save space
+    const safeSessions = sessions.slice(0, 100).map(s => ({
+      id:       sanitize(String(s.id || ''), 60),
+      title:    sanitize(String(s.title || 'Chat'), 80),
+      time:     typeof s.time === 'number' ? s.time : Date.now(),
+      messages: Array.isArray(s.messages)
+        ? s.messages.slice(-20).map(m => ({
+            role:    m.role === 'user' ? 'user' : 'assistant',
+            content: sanitize(String(m.content || ''), 2000)
+          }))
+        : []
+    }));
+
+    await db.collection('sessions').updateOne(
+      { email: safeEmail },
+      { $set: { email: safeEmail, userId: sanitize(userId || '', 60), sessions: safeSessions, updatedAt: Date.now() } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Sessions save error:', e.message);
+    res.json({ success: false }); // non-fatal — don't break client
+  }
+});
+
+app.get('/sessions/load', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    if (!db) return res.json({ success: true, sessions: [] });
+
+    const doc = await db.collection('sessions').findOne({ email: decodeURIComponent(email) });
+    res.json({ success: true, sessions: doc?.sessions || [] });
+  } catch (e) {
+    console.error('Sessions load error:', e.message);
+    res.json({ success: true, sessions: [] }); // non-fatal
+  }
 });
 
 // 404
