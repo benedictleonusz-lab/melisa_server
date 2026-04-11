@@ -142,35 +142,14 @@ app.use(generalLimit);
 // ROUTES
 // ══════════════════════════════════════════════════════════════
 
-// ── STATIC FILES — serve index.html and assets ────────────────
-const path = require('path');
-const fs   = require('fs');
-
-// Serve index.html at root (and for any unknown GET routes so the SPA works)
-app.get('/', (req, res) => {
-  const htmlFile = path.join(__dirname, 'index.html');
-  if (fs.existsSync(htmlFile)) {
-    res.sendFile(htmlFile);
-  } else {
-    res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0a0f1e;color:#fff">
-      <h2>✅ Melisa AI Server is running</h2>
-      <p>Place <b>index.html</b> in the same folder as server.js to serve the app.</p>
-      <p style="color:rgba(255,255,255,.4);font-size:13px">Server v4.0 · MongoDB: ${db?'✓ Connected':'✗ Not connected'}</p>
-    </body></html>`);
-  }
-});
-
-// Serve any other static files (images, icons, etc.) from same directory
-app.use(express.static(__dirname, { index: false, dotfiles: 'ignore' }));
-
-// Health check API endpoint
-app.get('/health', async (req, res) => {
+// Health check
+app.get('/', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '✓ Melisa AI Server v4.0',
+    status:  '✓ Melisa AI Server v4.0 — MongoDB Edition',
+    secure:  true,
     db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
-    pesapal: c.key ? '✓ Configured' : '✗ Not configured',
-    openai:  process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set'
+    pesapal: c.key ? '✓ Configured' : '✗ Not configured'
   });
 });
 
@@ -242,14 +221,7 @@ app.post('/api/chat', aiLimit, async (req, res) => {
     const preferredModel = model || doc.adminKeys.model || 'gpt-4o-mini';
     // Fallback chain: if preferred model fails, try these in order
     const FALLBACK_MODELS = ['gpt-4o-mini', 'gpt-3.5-turbo'];
-
-    // Check if any message contains image content — needs vision-capable model
-    const hasVision = messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'));
-    // Force gpt-4o for vision; gpt-3.5-turbo can't do images
-    const visionModel = hasVision ? 'gpt-4o' : preferredModel;
-    const modelsToTry = hasVision
-      ? ['gpt-4o', 'gpt-4o-mini']
-      : [preferredModel, ...FALLBACK_MODELS.filter(m => m !== preferredModel)];
+    const modelsToTry = [preferredModel, ...FALLBACK_MODELS.filter(m => m !== preferredModel)];
 
     // Core identity — always prepended so Melisa never forgets who made her
     const MELISA_CORE = `You are Melisa — a unique, powerful AI assistant built entirely by Benedict Zagamba, a 19-year-old developer from Tanzania, in 2026.
@@ -654,7 +626,14 @@ app.post('/azampay', async (req, res) => {
 });
 
 // 404
-app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+// SPA fallback — serve index.html for any GET that isn't an API route
+app.use((req, res, next) => {
+  if (req.method === 'GET' && !req.path.startsWith('/api') && !req.path.startsWith('/admin') && !req.path.startsWith('/user') && !req.path.startsWith('/create-payment') && !req.path.startsWith('/check-payment') && !req.path.startsWith('/pesapal')) {
+    const htmlFile = path.join(__dirname, 'index.html');
+    if (fs.existsSync(htmlFile)) return res.sendFile(htmlFile);
+  }
+  res.status(404).json({ error: 'Not found' });
+});
 
 // Error handler
 app.use((err, req, res, next) => {
@@ -662,10 +641,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-// Keep-alive ping — every 90s to prevent Render free-tier sleep
+// Keep-alive ping — every 55s to prevent Render free-tier sleep (must be <90s)
 setInterval(() => {
   fetch(SERVER_URL + '/ping').catch(() => {});
-}, 90 * 1000);
+}, 55 * 1000);
 
 // Start — connect DB first then listen
 connectDB().then(() => {
