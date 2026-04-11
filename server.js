@@ -412,16 +412,32 @@ app.post('/api/image', aiLimit, async (req, res) => {
     if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
 
     const safePrompt = sanitize(prompt, 1000);
-    const safeSize   = ['1024x1024', '512x512', '256x256'].includes(size) ? size : '1024x1024';
+    // DALL-E 3 only supports these sizes (not 512x512 or 256x256)
+    const validSizes = ['1024x1024', '1024x1792', '1792x1024'];
+    const safeSize   = validSizes.includes(size) ? size : '1024x1024';
+
+    console.log(`🎨 Generating HD image: "${safePrompt.slice(0, 60)}..."`);
 
     const r = await fetch('https://api.openai.com/v1/images/generations', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-      body: JSON.stringify({ model: 'dall-e-3', prompt: safePrompt, n: 1, size: safeSize, response_format: 'url' })
+      body: JSON.stringify({
+        model:           'dall-e-3',
+        prompt:          safePrompt,
+        n:               1,
+        size:            safeSize,
+        quality:         'hd',          // ← HD quality (was missing — this is the main quality fix)
+        style:           'vivid',        // more vibrant, detailed images
+        response_format: 'b64_json'      // ← direct data, no secondary URL fetch needed
+      })
     });
     const d = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image generation failed' });
-    res.json({ success: true, url: d.data[0].url, revised_prompt: d.data[0].revised_prompt });
+
+    // Return as a data URL so the browser renders it immediately — no second network request
+    const b64    = d.data[0].b64_json;
+    const dataUrl = `data:image/png;base64,${b64}`;
+    res.json({ success: true, url: dataUrl, revised_prompt: d.data[0].revised_prompt });
   } catch (e) {
     console.error('Image gen error:', e.message);
     res.status(500).json({ error: 'Image generation failed: ' + e.message });
