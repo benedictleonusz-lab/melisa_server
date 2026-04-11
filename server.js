@@ -111,7 +111,21 @@ async function registerIPN(token, cfg) {
 }
 
 // ── SECURITY MIDDLEWARE ────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  hsts: { maxAge: 31536000, includeSubDomains: true }
+}));
+
+// Remove server fingerprinting headers
+app.use((req, res, next) => {
+  res.removeHeader('X-Powered-By');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
 
 app.use(cors({
   origin: function (origin, cb) {
@@ -132,9 +146,9 @@ app.use(cors({
 
 app.use(express.json({ limit: '50kb' }));
 
-const generalLimit = rateLimit({ windowMs: 60000,      max: 120 });
+const generalLimit = rateLimit({ windowMs: 60000,      max: 100 });
 const adminLimit   = rateLimit({ windowMs: 900000,     max: 10,  message: { error: 'Too many admin attempts' } });
-const aiLimit      = rateLimit({ windowMs: 60000,      max: 40,  message: { error: 'AI rate limit reached'   } });
+const aiLimit      = rateLimit({ windowMs: 60000,      max: 30,  message: { error: 'Slow down a little! 😅 Try again in a minute.' } });
 const payLimit     = rateLimit({ windowMs: 600000,     max: 10,  message: { error: 'Too many payment requests' } });
 
 app.use(generalLimit);
@@ -412,25 +426,46 @@ app.post('/api/image', aiLimit, async (req, res) => {
     if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
 
     const safePrompt = sanitize(prompt, 1000);
-    // DALL-E 3 only supports these sizes (not 512x512 or 256x256)
     const validSizes = ['1024x1024', '1024x1792', '1792x1024'];
-    const safeSize   = validSizes.includes(size) ? size : '1024x1024';
+    const safeSize   = validSizes.includes(size) ? size : '1792x1024'; // default landscape
+
+    // Artistic enhancer — makes every image ultra-detailed and cinematic
+    const artisticBoost = [
+      'ultra HD 4K resolution',
+      'cinematic lighting',
+      'hyper-detailed',
+      'professional digital art',
+      'vibrant colors',
+      'sharp focus',
+      'high dynamic range',
+      'masterpiece quality'
+    ].join(', ');
+    const enhancedPrompt = safePrompt + '. Style: ' + artisticBoost;
 
     console.log(`🎨 Generating HD image: "${safePrompt.slice(0, 60)}..."`);
 
-    const r = await fetch('https://api.openai.com/v1/images/generations', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-      body: JSON.stringify({
-        model:           'dall-e-3',
-        prompt:          safePrompt,
-        n:               1,
-        size:            safeSize,
-        quality:         'hd',          // ← HD quality (was missing — this is the main quality fix)
-        style:           'vivid',        // more vibrant, detailed images
-        response_format: 'b64_json'      // ← direct data, no secondary URL fetch needed
-      })
-    });
+    // DALL-E HD can take up to 60s — use a generous timeout
+    const imgController = new AbortController();
+    const imgTimeout = setTimeout(() => imgController.abort(), 90000);
+    let r;
+    try {
+      r = await fetch('https://api.openai.com/v1/images/generations', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+        signal:  imgController.signal,
+        body: JSON.stringify({
+          model:           'dall-e-3',
+          prompt:          enhancedPrompt,
+          n:               1,
+          size:            safeSize,
+          quality:         'hd',
+          style:           'vivid',
+          response_format: 'b64_json'
+        })
+      });
+    } finally {
+      clearTimeout(imgTimeout);
+    }
     const d = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image generation failed' });
 
@@ -444,6 +479,22 @@ app.post('/api/image', aiLimit, async (req, res) => {
   }
 });
 
+
+// ── LYRICS SEARCH (uses Lyrics.ovh free API) ──
+app.get('/api/lyrics', aiLimit, async (req, res) => {
+  try {
+    const { artist, title } = req.query;
+    if (!artist || !title) return res.status(400).json({ error: 'artist and title required' });
+    const url = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artist) + '/' + encodeURIComponent(title);
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return res.status(404).json({ error: 'Lyrics not found' });
+    const d = await r.json();
+    if (!d.lyrics) return res.status(404).json({ error: 'Lyrics not found' });
+    res.json({ success: true, lyrics: d.lyrics.trim().slice(0, 8000) });
+  } catch (e) {
+    res.status(500).json({ error: 'Lyrics lookup failed' });
+  }
+});
 
 app.post('/admin/users', adminLimit, async (req, res) => {
   try {
