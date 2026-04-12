@@ -134,7 +134,7 @@ app.use((req, res, next) => {
   res.removeHeader('X-Powered-By');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  // Permissions-Policy intentionally omitted — mic + camera must be allowed
   next();
 });
 
@@ -386,10 +386,18 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
     if (audioBuf.length < 500) return res.json({ success: true, text: '' }); // too short
 
     // File extension from MIME type
-    const ext = (mimeType || '').includes('mp4') ? 'm4a'
-              : (mimeType || '').includes('ogg')  ? 'ogg'
+    // Detect file extension from MIME — iOS uses mp4/m4a, Android uses webm
+    const mt = (mimeType || '').toLowerCase();
+    const ext = mt.includes('mp4') || mt.includes('m4a') || mt.includes('aac') ? 'm4a'
+              : mt.includes('ogg') ? 'ogg'
+              : mt.includes('wav') ? 'wav'
+              : mt.includes('mp3') ? 'mp3'
               : 'webm';
-    const contentType = mimeType || 'audio/webm';
+    // Tell Whisper the correct audio type
+    const contentType = ext === 'm4a' ? 'audio/mp4'
+                      : ext === 'ogg' ? 'audio/ogg'
+                      : ext === 'wav' ? 'audio/wav'
+                      : 'audio/webm';
 
     // Build multipart/form-data manually — no extra packages needed
     const boundary = 'MelisaBoundary' + Date.now().toString(16);
@@ -414,14 +422,18 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
 
     const body = Buffer.concat(parts);
 
+    const whisperController = new AbortController();
+    const whisperTimeout = setTimeout(() => whisperController.abort(), 30000);
     const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method:  'POST',
       headers: {
         'Authorization': 'Bearer ' + apiKey,
         'Content-Type':  'multipart/form-data; boundary=' + boundary
       },
-      body
+      body,
+      signal: whisperController.signal
     });
+    clearTimeout(whisperTimeout);
 
     const raw = await whisperRes.text();
     if (!whisperRes.ok) {
@@ -505,17 +517,132 @@ app.post('/api/image', aiLimit, async (req, res) => {
 
 
 // ── LYRICS SEARCH (uses Lyrics.ovh free API) ──
+
+// ElevenLabs TTS — streams audio back to client
+app.post('/api/tts', aiLimit, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: 'No text' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'OpenAI key not configured' });
+
+    // Strip markdown/HTML, keep natural punctuation for good prosody
+    const safe = text
+      .replace(/<[^>]*>/g, '')
+      .replace(/```[\s\S]*?```/g, ' — ')
+      .replace(/[*_#`~>|]/g, '')
+      .replace(/\n{2,}/g, '. ')
+      .replace(/\n/g, ', ')
+      .trim()
+      .slice(0, 600);
+
+    if (!safe) return res.status(400).json({ error: 'No text after cleaning' });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    const r = await fetch('https://api.openai.com/v1/audio/speech', {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': 'Bearer ' + apiKey
+      },
+      body: JSON.stringify({
+        model:           'tts-1',          // fast, low-latency
+        input:           safe,
+        voice:           'nova',           // nova = soft, young, enthusiastic female
+        response_format: 'mp3',
+        speed:           1.08              // slightly faster = more energetic/excited
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (!r.ok) {
+      const err = await r.text().catch(() => '');
+      console.error('OpenAI TTS error', r.status, err.slice(0, 200));
+      return res.status(r.status).json({ error: 'TTS failed: ' + r.status });
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    r.body.pipe(res);
+  } catch (e) {
+    console.error('TTS error:', e.message);
+    res.status(500).json({ error: 'TTS failed: ' + e.message });
+  }
+});
+
 app.get('/api/lyrics', aiLimit, async (req, res) => {
   try {
     const { artist, title } = req.query;
-    if (!artist || !title) return res.status(400).json({ error: 'artist and title required' });
-    const url = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artist) + '/' + encodeURIComponent(title);
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return res.status(404).json({ error: 'Lyrics not found' });
-    const d = await r.json();
-    if (!d.lyrics) return res.status(404).json({ error: 'Lyrics not found' });
-    res.json({ success: true, lyrics: d.lyrics.trim().slice(0, 8000) });
+    if (!title) return res.status(400).json({ error: 'title required' });
+
+    const safeTitle  = decodeURIComponent(title).trim();
+    const safeArtist = artist ? decodeURIComponent(artist).trim() : '';
+
+    // Source 1: lrclib.net — large free library, returns structured data
+    try {
+      const q = 'https://lrclib.net/api/search?track_name=' + encodeURIComponent(safeTitle) +
+        (safeArtist ? '&artist_name=' + encodeURIComponent(safeArtist) : '');
+      const r = await fetch(q, {
+        headers: { 'User-Agent': 'MelisaAI/2.0' },
+        signal: AbortSignal.timeout(8000)
+      });
+      if (r.ok) {
+        const results = await r.json();
+        // Find best match — prefer exact artist match if available
+        let match = safeArtist
+          ? results.find(x => x.plainLyrics && x.artistName && x.artistName.toLowerCase().includes(safeArtist.toLowerCase()))
+          : null;
+        if (!match) match = results.find(x => x.plainLyrics && x.plainLyrics.length > 50);
+        if (match && match.plainLyrics) {
+          return res.json({
+            success:    true,
+            lyrics:     match.plainLyrics.trim().slice(0, 10000),
+            trackName:  match.trackName || safeTitle,
+            artistName: match.artistName || safeArtist,
+            source:     'lrclib'
+          });
+        }
+      }
+    } catch (e) { console.warn('lrclib:', e.message); }
+
+    // Source 2: lyrics.ovh — simpler but reliable for popular songs
+    try {
+      const artistForOvh = safeArtist || safeTitle.split(' ')[0]; // guess if no artist
+      const ovhUrl = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artistForOvh) + '/' + encodeURIComponent(safeTitle);
+      const or = await fetch(ovhUrl, { signal: AbortSignal.timeout(7000) });
+      if (or.ok) {
+        const od = await or.json();
+        if (od.lyrics && od.lyrics.length > 30) {
+          return res.json({ success: true, lyrics: od.lyrics.trim().slice(0, 10000), trackName: safeTitle, artistName: safeArtist, source: 'ovh' });
+        }
+      }
+    } catch (e) { console.warn('lyrics.ovh:', e.message); }
+
+    // Source 3: Happi.dev (free tier, no key needed for basic queries)
+    try {
+      const happiUrl = 'https://api.happi.dev/v1/music?q=' + encodeURIComponent(safeArtist + ' ' + safeTitle) + '&limit=1&lyrics=1&type=song';
+      const hr = await fetch(happiUrl, {
+        headers: { 'x-happi-key': 'free' },
+        signal: AbortSignal.timeout(6000)
+      });
+      if (hr.ok) {
+        const hd = await hr.json();
+        const hit = hd.result && hd.result[0];
+        if (hit && hit.lyrics) {
+          return res.json({ success: true, lyrics: hit.lyrics.slice(0, 10000), trackName: hit.track || safeTitle, artistName: hit.artist || safeArtist, source: 'happi' });
+        }
+      }
+    } catch (e) { console.warn('happi:', e.message); }
+
+    res.status(404).json({ error: 'Lyrics not found. Try adding the artist name — e.g. "lyrics Blinding Lights by The Weeknd"' });
   } catch (e) {
+    console.error('Lyrics error:', e.message);
     res.status(500).json({ error: 'Lyrics lookup failed' });
   }
 });
