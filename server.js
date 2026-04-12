@@ -9,6 +9,7 @@ const rateLimit = require('express-rate-limit');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const path      = require('path');
 const fs        = require('fs');
+const crypto    = require('crypto');
 
 const app = express();
 
@@ -26,7 +27,10 @@ async function connectDB() {
   if (!MONGODB_URI) { console.error('❌ MONGODB_URI not set'); return; }
   try {
     const client = new MongoClient(MONGODB_URI, {
-      serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
+      serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
+      connectTimeoutMS: 8000,
+      serverSelectionTimeoutMS: 8000,
+      socketTimeoutMS: 10000
     });
     await client.connect();
     db = client.db('melisa');
@@ -69,6 +73,11 @@ function sanitize(val, max) {
 
 function checkPass(pw) {
   return pw === ADMIN_PASS;
+}
+
+function hashPassword(raw) {
+  // Same simple hash the frontend uses — consistent cross-platform
+  return crypto.createHash('sha256').update('melisa_salt_' + raw).digest('hex');
 }
 
 // ── PESAPAL ────────────────────────────────────────────────────
@@ -548,6 +557,69 @@ app.post('/admin/clear-revenue', adminLimit, async (req, res) => {
   }
 });
 
+// Register new user
+app.post('/user/register', async (req, res) => {
+  try {
+    const { name, email, password, id, avatar, color } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+    if (!db) return res.status(503).json({ error: 'Database not available' });
+
+    const safeEmail = sanitize(email, 200);
+    const existing = await db.collection('users').findOne({ email: safeEmail });
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
+
+    const user = {
+      id:       sanitize(id || 'u_' + Date.now(), 60),
+      name:     sanitize(name, 100),
+      email:    safeEmail,
+      password: hashPassword(password),  // store hashed
+      plan:     'free',
+      created:  Date.now(),
+      avatar:   sanitize(avatar || name[0].toUpperCase(), 5),
+      color:    sanitize(color || '#1a3fff', 80),
+      isGoogle: false,
+      lastSeen: Date.now()
+    };
+    await db.collection('users').insertOne(user);
+
+    const { password: _pw, _id, ...safeUser } = user;
+    console.log('👤 New user registered:', safeEmail);
+    res.json({ success: true, user: safeUser });
+  } catch (e) {
+    console.error('Register error:', e.message);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Login user
+app.post('/user/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+    if (!db) return res.status(503).json({ error: 'Database not available' });
+
+    const safeEmail = sanitize(email, 200);
+    const user = await db.collection('users').findOne({ email: safeEmail });
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+
+    const hashed = hashPassword(password);
+    // Also accept legacy frontend hash (starts with 'h') stored from old localStorage saves
+    const legacyMatch = user.password && user.password === password;
+    if (user.password !== hashed && !legacyMatch) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Update lastSeen
+    await db.collection('users').updateOne({ email: safeEmail }, { $set: { lastSeen: Date.now() } });
+
+    const { password: _pw, _id, ...safeUser } = user;
+    res.json({ success: true, user: safeUser });
+  } catch (e) {
+    console.error('Login error:', e.message);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
 // Sync user
 app.post('/user/sync', async (req, res) => {
   try {
@@ -821,12 +893,16 @@ setInterval(() => {
   fetch(SERVER_URL + '/ping').catch(() => {});
 }, 55 * 1000);
 
-// Start — connect DB first then listen
+// Start immediately — don't block on DB connection
+app.listen(PORT, () => {
+  console.log('🚀 Melisa Server v4.0 — port ' + PORT);
+  console.log('🔒 Admin pass: ' + (ADMIN_PASS ? '✓ Set' : '✗ NOT SET'));
+  console.log('🤖 OpenAI: ' + (process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set'));
+});
+
+// Connect DB in background — server stays up even if DB is slow/unavailable
 connectDB().then(() => {
-  app.listen(PORT, () => {
-    console.log('🚀 Melisa Server v4.0 — port ' + PORT);
-    console.log('🍃 MongoDB: ' + (db ? '✓ Connected' : '✗ Not connected'));
-    console.log('🔒 Admin pass: ' + (ADMIN_PASS ? '✓ Set' : '✗ NOT SET'));
-    console.log('🤖 OpenAI: ' + (process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set'));
-  });
+  console.log('🍃 MongoDB: ' + (db ? '✓ Connected' : '✗ Not connected'));
+}).catch(e => {
+  console.error('🍃 MongoDB failed:', e.message);
 });
