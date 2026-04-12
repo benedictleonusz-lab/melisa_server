@@ -7,6 +7,8 @@ const fetch     = require('node-fetch');
 const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { MongoClient, ServerApiVersion } = require('mongodb');
+const path      = require('path');
+const fs        = require('fs');
 
 const app = express();
 
@@ -157,15 +159,28 @@ app.use(generalLimit);
 // ROUTES
 // ══════════════════════════════════════════════════════════════
 
-// Health check
-app.get('/', async (req, res) => {
+// Serve static frontend files
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '✓ Melisa AI Server v4.0 — MongoDB Edition',
+    status:  '\u2713 Melisa AI Server v4.0 — MongoDB Edition',
     secure:  true,
-    db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
-    pesapal: c.key ? '✓ Configured' : '✗ Not configured'
+    db:      db ? '\u2713 MongoDB Connected' : '\u2717 Not connected',
+    pesapal: c.key ? '\u2713 Configured' : '\u2717 Not configured'
   });
+});
+
+// Root — serve the frontend app
+app.get('/', (req, res) => {
+  const htmlFile = path.join(__dirname, 'index.html');
+  if (fs.existsSync(htmlFile)) return res.sendFile(htmlFile);
+  const pubFile = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(pubFile)) return res.sendFile(pubFile);
+  res.status(404).send('index.html not found — make sure it is deployed alongside server.js');
 });
 
 app.get('/ping', (req, res) => res.json({ pong: true, t: Date.now() }));
@@ -484,105 +499,15 @@ app.post('/api/image', aiLimit, async (req, res) => {
 app.get('/api/lyrics', aiLimit, async (req, res) => {
   try {
     const { artist, title } = req.query;
-    if (!title) return res.status(400).json({ error: 'title required' });
-
-    const safeArtist = (artist || '').trim();
-    const safeTitle  = title.trim();
-
-    // Source 1: lyrics.ovh
-    try {
-      const url = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(safeArtist || safeTitle) + '/' + encodeURIComponent(safeTitle);
-      const r = await fetch(url, { signal: AbortSignal.timeout(7000) });
-      if (r.ok) {
-        const d = await r.json();
-        if (d.lyrics && d.lyrics.length > 20) {
-          return res.json({ success: true, lyrics: d.lyrics.trim().slice(0, 8000), source: 'lyrics.ovh' });
-        }
-      }
-    } catch (e1) {}
-
-    // Source 2: lrclib.net (has full synced lyrics for many songs)
-    try {
-      const q = encodeURIComponent(safeArtist ? `${safeArtist} ${safeTitle}` : safeTitle);
-      const r2 = await fetch(`https://lrclib.net/api/search?q=${q}`, { signal: AbortSignal.timeout(7000) });
-      if (r2.ok) {
-        const d2 = await r2.json();
-        const hit = d2.find(x => x.plainLyrics && x.plainLyrics.length > 20);
-        if (hit) {
-          return res.json({ success: true, lyrics: hit.plainLyrics.slice(0, 8000), source: 'lrclib', trackName: hit.trackName, artistName: hit.artistName });
-        }
-      }
-    } catch (e2) {}
-
-    // Source 3: textyl.co
-    try {
-      const q3 = encodeURIComponent(`${safeArtist} ${safeTitle}`.trim());
-      const r3 = await fetch(`https://api.textyl.co/api/lyrics?q=${q3}`, { signal: AbortSignal.timeout(6000) });
-      if (r3.ok) {
-        const d3 = await r3.json();
-        if (Array.isArray(d3) && d3.length > 0) {
-          const lyricsText = d3.map(l => l.lyrics || l.text || '').join('\n');
-          if (lyricsText.length > 20) {
-            return res.json({ success: true, lyrics: lyricsText.slice(0, 8000), source: 'textyl' });
-          }
-        }
-      }
-    } catch (e3) {}
-
-    res.status(404).json({ error: 'Lyrics not found for this song. Try a different spelling or artist name.' });
+    if (!artist || !title) return res.status(400).json({ error: 'artist and title required' });
+    const url = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artist) + '/' + encodeURIComponent(title);
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return res.status(404).json({ error: 'Lyrics not found' });
+    const d = await r.json();
+    if (!d.lyrics) return res.status(404).json({ error: 'Lyrics not found' });
+    res.json({ success: true, lyrics: d.lyrics.trim().slice(0, 8000) });
   } catch (e) {
     res.status(500).json({ error: 'Lyrics lookup failed' });
-  }
-});
-
-
-// ── ElevenLabs TTS proxy — key never exposed to browser ──
-app.post('/api/tts', aiLimit, async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: 'No text' });
-
-    const doc    = await getCfgDoc();
-    const apiKey = doc.adminKeys.elevenlabs || process.env.ELEVENLABS_API_KEY || 'sk_9acb25f76baac172642d6b80ef8c66e40e9a84cd4db201be';
-    const voiceId= doc.adminKeys.elevenlabs_voice_id || process.env.ELEVENLABS_VOICE_ID || 'tMXujoAjiboschVOhAnk';
-
-    if (!apiKey) return res.status(503).json({ error: 'TTS not configured' });
-
-    const clean = text.replace(/[*#_`~]/g, '').slice(0, 500); // strip markdown, cap length
-
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'xi-api-key':    apiKey,
-        'Accept':        'audio/mpeg'
-      },
-      body: JSON.stringify({
-        text: clean,
-        model_id: 'eleven_turbo_v2_5',   // fastest model, low latency
-        voice_settings: {
-          stability:        0.45,
-          similarity_boost: 0.82,
-          style:            0.35,
-          use_speaker_boost: true
-        }
-      }),
-      signal: AbortSignal.timeout(20000)
-    });
-
-    if (!r.ok) {
-      const err = await r.text();
-      console.error('ElevenLabs error:', r.status, err.slice(0, 200));
-      return res.status(r.status).json({ error: 'TTS failed: ' + r.status });
-    }
-
-    // Stream the audio directly to the browser
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-cache');
-    r.body.pipe(res);
-  } catch (e) {
-    console.error('TTS error:', e.message);
-    res.status(500).json({ error: 'TTS error: ' + e.message });
   }
 });
 
@@ -779,61 +704,48 @@ app.get('/pesapal-webhook', async (req, res) => {
 });
 
 // Live news — fetch real RSS headlines server-side (no CORS issues)
-// News cache: refresh every 4 minutes
-let _newsCache = { headlines: [], ts: 0 };
-
 app.get('/api/news', async (req, res) => {
-  const count = Math.min(parseInt(req.query.count) || 1, 20);
-  const now = Date.now();
-
-  // Serve from cache if fresh (4 min)
-  if (_newsCache.headlines.length >= 5 && now - _newsCache.ts < 4 * 60 * 1000) {
-    const h = _newsCache.headlines[Math.floor(Math.random() * _newsCache.headlines.length)];
-    return res.json({ success: true, headline: h, headlines: _newsCache.headlines.slice(0, count), source: 'BBC/Reuters' });
-  }
-
   const feeds = [
-    { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',               src: 'BBC World' },
-    { url: 'https://feeds.bbci.co.uk/news/technology/rss.xml',          src: 'BBC Tech' },
-    { url: 'https://feeds.bbci.co.uk/news/business/rss.xml',            src: 'BBC Business' },
-    { url: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml', src: 'BBC Science' },
-    { url: 'https://feeds.skynews.com/feeds/rss/world.xml',             src: 'Sky News' },
-    { url: 'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',    src: 'NY Times' },
-    { url: 'https://feeds.a.dj.com/rss/RSSWorldNews.xml',               src: 'WSJ' },
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://feeds.bbci.co.uk/news/technology/rss.xml',
+    'https://feeds.bbci.co.uk/news/business/rss.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://feeds.reuters.com/reuters/topNews',
+    'https://feeds.reuters.com/reuters/technologyNews',
   ];
 
-  const allTitles = [];
-  const shuffled = feeds.sort(() => Math.random() - 0.5);
-
-  for (const { url, src } of shuffled.slice(0, 4)) {
+  // Try each feed until one works
+  for (const feedUrl of feeds.sort(() => Math.random() - 0.5)) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaBot/2.0)' } });
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const r = await fetch(feedUrl, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/1.0)' }
+      });
       clearTimeout(timeout);
       if (!r.ok) continue;
+
       const xml = await r.text();
-      const re = /<title>(?:<!\[CDATA\[)?([^<\]]{10,200})(?:\]\]>)?<\/title>/g;
+      // Parse <item> titles from RSS XML
+      const titles = [];
+      const titleRe = /<item[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
       let m;
-      let count2 = 0;
-      while ((m = re.exec(xml)) !== null && count2 < 8) {
-        const t = m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").trim();
-        if (t && t.length > 15 && !t.includes('BBC') && !t.includes('Sky News') && !allTitles.includes(t)) {
-          allTitles.push(t);
-          count2++;
-        }
+      while ((m = titleRe.exec(xml)) !== null && titles.length < 10) {
+        const t = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+        if (t && t.length > 10) titles.push(t);
       }
-      if (allTitles.length >= 15) break;
-    } catch (e) { continue; }
+
+      if (titles.length > 0) {
+        const headline = titles[Math.floor(Math.random() * Math.min(titles.length, 5))];
+        return res.json({ success: true, headline, source: feedUrl.includes('bbc') ? 'BBC' : 'Reuters' });
+      }
+    } catch (e) {
+      continue; // try next feed
+    }
   }
 
-  if (allTitles.length > 0) {
-    _newsCache = { headlines: allTitles, ts: now };
-    const h = allTitles[Math.floor(Math.random() * allTitles.length)];
-    return res.json({ success: true, headline: h, headlines: allTitles.slice(0, count), source: 'Live' });
-  }
-
-  res.json({ success: false, headline: 'Live news temporarily unavailable', headlines: [] });
+  res.json({ success: false, headline: 'Live news temporarily unavailable' });
 });
 
 // AzamPay endpoint
