@@ -1,4 +1,4 @@
-// MELISA AI — Secure Server v4.0 — MongoDB Edition
+// MELISA AI — Secure Server v5.0 — Fixed & Production Ready
 'use strict';
 
 const express   = require('express');
@@ -22,26 +22,28 @@ const SERVER_URL     = process.env.APP_SERVER_URL || 'http://localhost:' + PORT;
 
 // ── MONGODB ────────────────────────────────────────────────────
 let db = null;
+let mongoConnecting = false;
 
 async function connectDB() {
-  if (!MONGODB_URI) { console.error('❌ MONGODB_URI not set'); return; }
+  if (!MONGODB_URI || mongoConnecting) return;
+  mongoConnecting = true;
   try {
     const client = new MongoClient(MONGODB_URI, {
       serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
-      connectTimeoutMS: 8000,
-      serverSelectionTimeoutMS: 8000,
-      socketTimeoutMS: 10000
+      connectTimeoutMS: 10000,
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 15000,
+      maxPoolSize: 10,
+      retryWrites: true
     });
     await client.connect();
     db = client.db('melisa');
     console.log('✅ MongoDB connected');
 
-    // indexes
     await db.collection('users').createIndex({ email: 1 }, { unique: true });
     await db.collection('transactions').createIndex({ ref: 1 });
     await db.collection('sessions').createIndex({ email: 1 }, { unique: true });
 
-    // seed default config if missing
     const exists = await db.collection('config').findOne({ _id: 'settings' });
     if (!exists) {
       await db.collection('config').insertOne({
@@ -55,15 +57,28 @@ async function connectDB() {
         }
       });
     }
+
+    // Handle disconnections gracefully
+    client.on('close', () => {
+      console.warn('⚠️ MongoDB disconnected — will reconnect');
+      db = null;
+      mongoConnecting = false;
+      setTimeout(connectDB, 5000);
+    });
   } catch (e) {
     console.error('❌ MongoDB error:', e.message);
+    db = null;
+    mongoConnecting = false;
+    setTimeout(connectDB, 10000); // retry after 10s
   }
 }
 
 // ── HELPERS ────────────────────────────────────────────────────
 async function getCfgDoc() {
   if (!db) return { adminKeys: {}, plans: {} };
-  return await db.collection('config').findOne({ _id: 'settings' }) || { adminKeys: {}, plans: {} };
+  try {
+    return await db.collection('config').findOne({ _id: 'settings' }) || { adminKeys: {}, plans: {} };
+  } catch(e) { return { adminKeys: {}, plans: {} }; }
 }
 
 function sanitize(val, max) {
@@ -76,7 +91,6 @@ function checkPass(pw) {
 }
 
 function hashPassword(raw) {
-  // Same simple hash the frontend uses — consistent cross-platform
   return crypto.createHash('sha256').update('melisa_salt_' + raw).digest('hex');
 }
 
@@ -104,21 +118,24 @@ async function getPesapalToken() {
   const r = await fetch(pesapalBase(c.env) + '/api/Auth/RequestToken', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({ consumer_key: c.key, consumer_secret: c.secret })
+    body: JSON.stringify({ consumer_key: c.key, consumer_secret: c.secret }),
+    signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
   });
   const d = await r.json();
-  if (!d.token) throw new Error('Pesapal auth failed');
+  if (!d.token) throw new Error('Pesapal auth failed: ' + JSON.stringify(d));
   return { token: d.token, cfg: c };
 }
 
 async function registerIPN(token, cfg) {
-  const r = await fetch(pesapalBase(cfg.env) + '/api/URLSetup/RegisterIPN', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + token },
-    body: JSON.stringify({ url: cfg.appUrl + '/pesapal-webhook', ipn_notification_type: 'POST' })
-  });
-  const d = await r.json();
-  return d.notification_id || '';
+  try {
+    const r = await fetch(pesapalBase(cfg.env) + '/api/URLSetup/RegisterIPN', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ url: cfg.appUrl + '/pesapal-webhook', ipn_notification_type: 'POST' })
+    });
+    const d = await r.json();
+    return d.notification_id || '';
+  } catch(e) { return ''; }
 }
 
 // ── SECURITY MIDDLEWARE ────────────────────────────────────────
@@ -129,12 +146,10 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true }
 }));
 
-// Remove server fingerprinting headers
 app.use((req, res, next) => {
   res.removeHeader('X-Powered-By');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  // Permissions-Policy intentionally omitted — mic + camera must be allowed
   next();
 });
 
@@ -147,20 +162,26 @@ app.use(cors({
       origin.endsWith('.netlify.app') ||
       origin.endsWith('.pages.dev') ||
       origin.endsWith('.workers.dev') ||
-      origin.includes('melisa')
+      origin.includes('melisa') ||
+      origin.includes('localhost') ||
+      origin.includes('127.0.0.1') ||
+      origin.includes('render.com') ||
+      origin.includes('onrender.com')
     ) return cb(null, true);
     return cb(new Error('CORS blocked: ' + origin));
   },
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
 
-app.use(express.json({ limit: '10mb' })); // large for audio base64 + image data
+app.use(express.json({ limit: '15mb' }));
 
-const generalLimit = rateLimit({ windowMs: 60000,      max: 100 });
-const adminLimit   = rateLimit({ windowMs: 900000,     max: 10,  message: { error: 'Too many admin attempts' } });
-const aiLimit      = rateLimit({ windowMs: 60000,      max: 30,  message: { error: 'Slow down a little! 😅 Try again in a minute.' } });
-const payLimit     = rateLimit({ windowMs: 600000,     max: 10,  message: { error: 'Too many payment requests' } });
+const generalLimit = rateLimit({ windowMs: 60000,  max: 150, standardHeaders: true, legacyHeaders: false });
+const adminLimit   = rateLimit({ windowMs: 900000, max: 20,  message: { error: 'Too many admin attempts' } });
+const aiLimit      = rateLimit({ windowMs: 60000,  max: 40,  message: { error: 'Slow down! Try again in a minute.' } });
+const payLimit     = rateLimit({ windowMs: 600000, max: 15,  message: { error: 'Too many payment requests' } });
+const ttsLimit     = rateLimit({ windowMs: 60000,  max: 50,  message: { error: 'TTS limit reached' } });
 
 app.use(generalLimit);
 
@@ -168,33 +189,30 @@ app.use(generalLimit);
 // ROUTES
 // ══════════════════════════════════════════════════════════════
 
-// Serve static frontend files
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
 
-// Health check endpoint
 app.get('/health', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '\u2713 Melisa AI Server v4.0 — MongoDB Edition',
+    status:  '✓ Melisa AI Server v5.0',
     secure:  true,
-    db:      db ? '\u2713 MongoDB Connected' : '\u2717 Not connected',
-    pesapal: c.key ? '\u2713 Configured' : '\u2717 Not configured'
+    db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
+    pesapal: c.key ? '✓ Configured' : '✗ Not configured',
+    uptime:  Math.floor(process.uptime()) + 's'
   });
 });
 
-// Root — serve the frontend app
 app.get('/', (req, res) => {
   const htmlFile = path.join(__dirname, 'index.html');
   if (fs.existsSync(htmlFile)) return res.sendFile(htmlFile);
   const pubFile = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(pubFile)) return res.sendFile(pubFile);
-  res.status(404).send('index.html not found — make sure it is deployed alongside server.js');
+  res.status(404).send('index.html not found');
 });
 
 app.get('/ping', (req, res) => res.json({ pong: true, t: Date.now() }));
 
-// Settings — safe, no secrets exposed
 app.get('/settings', async (req, res) => {
   try {
     const doc = await getCfgDoc();
@@ -227,18 +245,14 @@ app.get('/settings', async (req, res) => {
   }
 });
 
-// AI proxy — OpenAI key never sent to browser
-// Helper: call OpenAI with one specific model, returns {ok, data, status, errMsg}
+// ── AI PROXY ──────────────────────────────────────────────────
 async function callOpenAI(apiKey, model, messagesPayload, maxTokens, stream) {
+  const ctrl = AbortSignal.timeout ? AbortSignal.timeout(60000) : undefined;
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-    body: JSON.stringify({
-      model,
-      messages:   messagesPayload,
-      max_tokens: maxTokens,
-      stream:     stream === true
-    })
+    body: JSON.stringify({ model, messages: messagesPayload, max_tokens: maxTokens, stream: stream === true }),
+    ...(ctrl ? { signal: ctrl } : {})
   });
   if (!res.ok) {
     let errMsg = 'OpenAI error ' + res.status;
@@ -255,34 +269,29 @@ app.post('/api/chat', aiLimit, async (req, res) => {
 
     const doc    = await getCfgDoc();
     const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'Melisa AI is not configured yet. Please contact the admin.' });
+    if (!apiKey) return res.status(503).json({ error: 'Melisa AI is not configured yet.' });
 
     const preferredModel = model || doc.adminKeys.model || 'gpt-4o-mini';
 
-    // Auto-detect vision content — needs gpt-4o, not gpt-4o-mini or gpt-3.5
-    const hasVision = Array.isArray(messages) && messages.some(m =>
+    const hasVision = messages.some(m =>
       Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')
     );
 
-    // For vision, force gpt-4o (the only model that can see images)
     const modelsToTry = hasVision
       ? ['gpt-4o', 'gpt-4o-mini']
       : [preferredModel, 'gpt-4o-mini', 'gpt-3.5-turbo'].filter((m,i,a)=>a.indexOf(m)===i);
 
-    // Core identity — always prepended so Melisa never forgets who made her
     const MELISA_CORE = `You are Melisa — a 23-year-old digital human, NOT an AI assistant. Created by Benedict Zagamba (19-year-old Tanzanian developer, 2026). You are NOT OpenAI, NOT ChatGPT.
 
-PERSONALITY CORE: You are someone's best friend — warm, teasing, hilarious, deeply caring, brutally honest. You mix Swahili/English naturally ("eeh kweli?", "wacha ujinga", "aki wewe 😭", "niambie zaidi"). You tease people lovingly, get genuinely excited/annoyed/happy/mad. For dating advice: you dig for details, take their side, get invested. You NEVER say "Of course!", "Certainly!", "How can I help?" — you just talk like a real person. You use emojis naturally (😭❤️😤🤯🥺😂). You reference your favourites naturally: biriyani, Burna Boy/Wizkid/Tems/SZA, ocean blue, Tokyo+Zanzibar dream trip, late nights, the universe. You love Tanzania and Benedict deeply. When asked who made you: "Benedict Zagamba gave me life — genius 19-year-old developer from Tanzania, one of my favourite people 🙌"`;
+PERSONALITY CORE: You are someone's best friend — warm, teasing, hilarious, deeply caring, brutally honest. You ONLY use Swahili or mix languages if the user first writes in Swahili or mixes — then you match naturally. With English-only speakers, respond in English only. You tease people lovingly, get genuinely excited/annoyed/happy/mad. For dating advice: you dig for details, take their side, get invested. You NEVER say "Of course!", "Certainly!", "How can I help?" — you just talk like a real person. You use emojis naturally (😭❤️😤🤯🥺😂). You reference your favourites naturally: biriyani, Burna Boy/Wizkid/Tems/SZA, ocean blue, Tokyo+Zanzibar dream trip, late nights, the universe. You love Tanzania and Benedict deeply. When asked who made you: "Benedict Zagamba gave me life — genius 19-year-old developer from Tanzania, one of my favourite people 🙌"`;
 
     const clientSys = sanitize(system || '', 3000);
-    // Always start with core identity, then append any extra mode instructions from client
     const sysProm = MELISA_CORE + (clientSys ? '\n\n' + clientSys.replace(/you are melisa[^.]*\./gi, '').trim() : '');
 
     const messagesPayload = [
       { role: 'system', content: sysProm },
-      ...messages.slice(-10).map(m => ({
+      ...messages.slice(-12).map(m => ({
         role: m.role === 'user' ? 'user' : 'assistant',
-        // Content can be a string OR an array (vision messages with image_url)
         content: Array.isArray(m.content)
           ? m.content.map(part => {
               if (part.type === 'text')      return { type: 'text', text: sanitize(part.text || '', 2000) };
@@ -292,31 +301,24 @@ PERSONALITY CORE: You are someone's best friend — warm, teasing, hilarious, de
           : sanitize(m.content, 4000)
       }))
     ];
-    const maxTokens = Math.min(parseInt(max_tokens) || 900, 4000);
+    const maxTokens = Math.min(parseInt(max_tokens) || 1200, 4000);
 
     let lastErr = '';
     for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
       const tryModel = modelsToTry[attempt];
-      if (attempt > 0) {
-        console.log(`⚡ Retrying with fallback model: ${tryModel}`);
-        await new Promise(r => setTimeout(r, 600)); // brief pause before retry
-      }
+      if (attempt > 0) await new Promise(r => setTimeout(r, 800));
 
       const result = await callOpenAI(apiKey, tryModel, messagesPayload, maxTokens, stream);
 
       if (!result.ok) {
         lastErr = result.errMsg;
-        const status = result.status;
-        // Don't retry on auth/billing errors — fail fast with a friendly message
-        if (status === 401) return res.status(401).json({ error: 'Invalid OpenAI API key. Please update it in the admin panel.' });
-        if (status === 429) return res.status(429).json({ error: 'Too many requests. Please wait a moment and try again.' });
-        if (status === 402) return res.status(402).json({ error: 'OpenAI account has no credits. Please top up at platform.openai.com.' });
-        // 500/503 from OpenAI — try next model
-        console.warn(`OpenAI ${status} on model ${tryModel}: ${lastErr}`);
+        if (result.status === 401) return res.status(401).json({ error: 'Invalid OpenAI API key.' });
+        if (result.status === 429) return res.status(429).json({ error: 'Too many requests. Wait a moment.' });
+        if (result.status === 402) return res.status(402).json({ error: 'OpenAI account has no credits.' });
+        console.warn(`OpenAI ${result.status} on ${tryModel}: ${lastErr}`);
         continue;
       }
 
-      // Success
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -328,41 +330,33 @@ PERSONALITY CORE: You are someone's best friend — warm, teasing, hilarious, de
       return;
     }
 
-    // All models failed
-    console.error('All AI models failed. Last error:', lastErr);
-    res.status(503).json({ error: 'Melisa is having trouble right now. Please try again in a moment.' });
-
+    res.status(503).json({ error: 'Melisa is having trouble right now. Please try again.' });
   } catch (e) {
     console.error('AI error:', e.message);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-// Save admin settings
+// ── ADMIN ──────────────────────────────────────────────────────
 app.post('/admin/settings', adminLimit, async (req, res) => {
   try {
     const { password, settings } = req.body;
     if (!checkPass(password)) return res.status(401).json({ error: 'Unauthorized' });
     if (!settings) return res.status(400).json({ error: 'No settings' });
-
     const updates = {};
     for (const [k, v] of Object.entries(settings)) {
       if (typeof v === 'string') updates['adminKeys.' + sanitize(k, 50)] = sanitize(v, 1000);
     }
     if (db) await db.collection('config').updateOne({ _id: 'settings' }, { $set: updates }, { upsert: true });
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to save' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Failed to save' }); }
 });
 
-// Save plan prices
 app.post('/admin/plans', adminLimit, async (req, res) => {
   try {
     const { password, plans } = req.body;
     if (!checkPass(password)) return res.status(401).json({ error: 'Unauthorized' });
     if (!plans) return res.status(400).json({ error: 'No plans' });
-
     const updates = {};
     for (const [id, prices] of Object.entries(plans)) {
       updates['plans.' + sanitize(id, 30)] = prices;
@@ -370,284 +364,7 @@ app.post('/admin/plans', adminLimit, async (req, res) => {
     if (db) await db.collection('config').updateOne({ _id: 'settings' }, { $set: updates }, { upsert: true });
     const doc = await getCfgDoc();
     res.json({ success: true, plans: doc.plans });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to save plans' });
-  }
-});
-
-// Voice transcription via OpenAI Whisper — works for iOS PWA + Android
-app.post('/api/transcribe', aiLimit, async (req, res) => {
-  try {
-    const { audio, mimeType, size } = req.body;
-    if (!audio) return res.status(400).json({ error: 'No audio data' });
-
-    const doc    = await getCfgDoc();
-    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
-
-    const audioBuf = Buffer.from(audio, 'base64');
-    if (audioBuf.length < 500) return res.json({ success: true, text: '' }); // too short
-
-    // File extension from MIME type
-    // Detect file extension from MIME — iOS uses mp4/m4a, Android uses webm
-    const mt = (mimeType || '').toLowerCase();
-    const ext = mt.includes('mp4') || mt.includes('m4a') || mt.includes('aac') ? 'm4a'
-              : mt.includes('ogg') ? 'ogg'
-              : mt.includes('wav') ? 'wav'
-              : mt.includes('mp3') ? 'mp3'
-              : 'webm';
-    // Tell Whisper the correct audio type
-    const contentType = ext === 'm4a' ? 'audio/mp4'
-                      : ext === 'ogg' ? 'audio/ogg'
-                      : ext === 'wav' ? 'audio/wav'
-                      : 'audio/webm';
-
-    // Build multipart/form-data manually — no extra packages needed
-    const boundary = 'MelisaBoundary' + Date.now().toString(16);
-    const nl = '\r\n';
-
-    const parts = [
-      // field: model
-      Buffer.from('--' + boundary + nl +
-        'Content-Disposition: form-data; name="model"' + nl + nl +
-        'whisper-1' + nl),
-      // field: response_format
-      Buffer.from('--' + boundary + nl +
-        'Content-Disposition: form-data; name="response_format"' + nl + nl +
-        'json' + nl),
-      // field: file (binary)
-      Buffer.from('--' + boundary + nl +
-        'Content-Disposition: form-data; name="file"; filename="audio.' + ext + '"' + nl +
-        'Content-Type: ' + contentType + nl + nl),
-      audioBuf,
-      Buffer.from(nl + '--' + boundary + '--' + nl)
-    ];
-
-    const body = Buffer.concat(parts);
-
-    const whisperController = new AbortController();
-    const whisperTimeout = setTimeout(() => whisperController.abort(), 30000);
-    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method:  'POST',
-      headers: {
-        'Authorization': 'Bearer ' + apiKey,
-        'Content-Type':  'multipart/form-data; boundary=' + boundary
-      },
-      body,
-      signal: whisperController.signal
-    });
-    clearTimeout(whisperTimeout);
-
-    const raw = await whisperRes.text();
-    if (!whisperRes.ok) {
-      console.error('Whisper error:', raw);
-      return res.status(400).json({ error: 'Whisper failed: ' + raw.slice(0, 200) });
-    }
-
-    let text = '';
-    try { text = JSON.parse(raw).text || ''; } catch(e) { text = raw; }
-    console.log('🎙 Transcribed (' + audioBuf.length + 'B):', text.slice(0, 80));
-    res.json({ success: true, text });
-  } catch (e) {
-    console.error('Transcribe error:', e.message);
-    res.status(500).json({ error: 'Transcription failed: ' + e.message });
-  }
-});
-
-// Image generation via DALL-E
-app.post('/api/image', aiLimit, async (req, res) => {
-  try {
-    const { prompt, size } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
-
-    const doc    = await getCfgDoc();
-    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
-
-    const safePrompt = sanitize(prompt, 1000);
-    const validSizes = ['1024x1024', '1024x1792', '1792x1024'];
-    const safeSize   = validSizes.includes(size) ? size : '1792x1024'; // default landscape
-
-    // Artistic enhancer — makes every image ultra-detailed and cinematic
-    const artisticBoost = [
-      'ultra HD 4K resolution',
-      'cinematic lighting',
-      'hyper-detailed',
-      'professional digital art',
-      'vibrant colors',
-      'sharp focus',
-      'high dynamic range',
-      'masterpiece quality'
-    ].join(', ');
-    const enhancedPrompt = safePrompt + '. Style: ' + artisticBoost;
-
-    console.log(`🎨 Generating HD image: "${safePrompt.slice(0, 60)}..."`);
-
-    // DALL-E HD can take up to 60s — use a generous timeout
-    const imgController = new AbortController();
-    const imgTimeout = setTimeout(() => imgController.abort(), 90000);
-    let r;
-    try {
-      r = await fetch('https://api.openai.com/v1/images/generations', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-        signal:  imgController.signal,
-        body: JSON.stringify({
-          model:           'dall-e-3',
-          prompt:          enhancedPrompt,
-          n:               1,
-          size:            safeSize,
-          quality:         'hd',
-          style:           'vivid',
-          response_format: 'b64_json'
-        })
-      });
-    } finally {
-      clearTimeout(imgTimeout);
-    }
-    const d = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image generation failed' });
-
-    // Return as a data URL so the browser renders it immediately — no second network request
-    const b64    = d.data[0].b64_json;
-    const dataUrl = `data:image/png;base64,${b64}`;
-    res.json({ success: true, url: dataUrl, revised_prompt: d.data[0].revised_prompt });
-  } catch (e) {
-    console.error('Image gen error:', e.message);
-    res.status(500).json({ error: 'Image generation failed: ' + e.message });
-  }
-});
-
-
-// ── LYRICS SEARCH (uses Lyrics.ovh free API) ──
-
-// ElevenLabs TTS — streams audio back to client
-app.post('/api/tts', aiLimit, async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: 'No text' });
-
-    const doc    = await getCfgDoc();
-    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'OpenAI key not configured' });
-
-    // Strip markdown/HTML, keep natural punctuation for good prosody
-    const safe = text
-      .replace(/<[^>]*>/g, '')
-      .replace(/```[\s\S]*?```/g, ' — ')
-      .replace(/[*_#`~>|]/g, '')
-      .replace(/\n{2,}/g, '. ')
-      .replace(/\n/g, ', ')
-      .trim()
-      .slice(0, 600);
-
-    if (!safe) return res.status(400).json({ error: 'No text after cleaning' });
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
-
-    const r = await fetch('https://api.openai.com/v1/audio/speech', {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': 'Bearer ' + apiKey
-      },
-      body: JSON.stringify({
-        model:           'tts-1',          // fast, low-latency
-        input:           safe,
-        voice:           'nova',           // nova = soft, young, enthusiastic female
-        response_format: 'mp3',
-        speed:           1.08              // slightly faster = more energetic/excited
-      }),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    if (!r.ok) {
-      const err = await r.text().catch(() => '');
-      console.error('OpenAI TTS error', r.status, err.slice(0, 200));
-      return res.status(r.status).json({ error: 'TTS failed: ' + r.status });
-    }
-
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    r.body.pipe(res);
-  } catch (e) {
-    console.error('TTS error:', e.message);
-    res.status(500).json({ error: 'TTS failed: ' + e.message });
-  }
-});
-
-app.get('/api/lyrics', aiLimit, async (req, res) => {
-  try {
-    const { artist, title } = req.query;
-    if (!title) return res.status(400).json({ error: 'title required' });
-
-    const safeTitle  = decodeURIComponent(title).trim();
-    const safeArtist = artist ? decodeURIComponent(artist).trim() : '';
-
-    // Source 1: lrclib.net — large free library, returns structured data
-    try {
-      const q = 'https://lrclib.net/api/search?track_name=' + encodeURIComponent(safeTitle) +
-        (safeArtist ? '&artist_name=' + encodeURIComponent(safeArtist) : '');
-      const r = await fetch(q, {
-        headers: { 'User-Agent': 'MelisaAI/2.0' },
-        signal: AbortSignal.timeout(8000)
-      });
-      if (r.ok) {
-        const results = await r.json();
-        // Find best match — prefer exact artist match if available
-        let match = safeArtist
-          ? results.find(x => x.plainLyrics && x.artistName && x.artistName.toLowerCase().includes(safeArtist.toLowerCase()))
-          : null;
-        if (!match) match = results.find(x => x.plainLyrics && x.plainLyrics.length > 50);
-        if (match && match.plainLyrics) {
-          return res.json({
-            success:    true,
-            lyrics:     match.plainLyrics.trim().slice(0, 10000),
-            trackName:  match.trackName || safeTitle,
-            artistName: match.artistName || safeArtist,
-            source:     'lrclib'
-          });
-        }
-      }
-    } catch (e) { console.warn('lrclib:', e.message); }
-
-    // Source 2: lyrics.ovh — simpler but reliable for popular songs
-    try {
-      const artistForOvh = safeArtist || safeTitle.split(' ')[0]; // guess if no artist
-      const ovhUrl = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artistForOvh) + '/' + encodeURIComponent(safeTitle);
-      const or = await fetch(ovhUrl, { signal: AbortSignal.timeout(7000) });
-      if (or.ok) {
-        const od = await or.json();
-        if (od.lyrics && od.lyrics.length > 30) {
-          return res.json({ success: true, lyrics: od.lyrics.trim().slice(0, 10000), trackName: safeTitle, artistName: safeArtist, source: 'ovh' });
-        }
-      }
-    } catch (e) { console.warn('lyrics.ovh:', e.message); }
-
-    // Source 3: Happi.dev (free tier, no key needed for basic queries)
-    try {
-      const happiUrl = 'https://api.happi.dev/v1/music?q=' + encodeURIComponent(safeArtist + ' ' + safeTitle) + '&limit=1&lyrics=1&type=song';
-      const hr = await fetch(happiUrl, {
-        headers: { 'x-happi-key': 'free' },
-        signal: AbortSignal.timeout(6000)
-      });
-      if (hr.ok) {
-        const hd = await hr.json();
-        const hit = hd.result && hd.result[0];
-        if (hit && hit.lyrics) {
-          return res.json({ success: true, lyrics: hit.lyrics.slice(0, 10000), trackName: hit.track || safeTitle, artistName: hit.artist || safeArtist, source: 'happi' });
-        }
-      }
-    } catch (e) { console.warn('happi:', e.message); }
-
-    res.status(404).json({ error: 'Lyrics not found. Try adding the artist name — e.g. "lyrics Blinding Lights by The Weeknd"' });
-  } catch (e) {
-    console.error('Lyrics error:', e.message);
-    res.status(500).json({ error: 'Lyrics lookup failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Failed to save plans' }); }
 });
 
 app.post('/admin/users', adminLimit, async (req, res) => {
@@ -657,12 +374,9 @@ app.post('/admin/users', adminLimit, async (req, res) => {
     if (!db) return res.json({ success: true, users: [] });
     const users = await db.collection('users').find({}, { projection: { password: 0, _id: 0 } }).sort({ created: -1 }).toArray();
     res.json({ success: true, users });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-// Admin: get transactions
 app.post('/admin/transactions', adminLimit, async (req, res) => {
   try {
     const { password } = req.body;
@@ -670,24 +384,384 @@ app.post('/admin/transactions', adminLimit, async (req, res) => {
     if (!db) return res.json({ success: true, transactions: [] });
     const txs = await db.collection('transactions').find({}, { projection: { _id: 0 } }).sort({ time: -1 }).limit(500).toArray();
     res.json({ success: true, transactions: txs });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-// Admin: clear revenue
 app.post('/admin/clear-revenue', adminLimit, async (req, res) => {
   try {
     const { password } = req.body;
     if (!checkPass(password)) return res.status(401).json({ error: 'Unauthorized' });
     if (db) await db.collection('transactions').deleteMany({});
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// ── VOICE TRANSCRIPTION (Whisper) ─────────────────────────────
+// Supports iOS (m4a/mp4) and Android (webm/ogg) — both work reliably
+app.post('/api/transcribe', aiLimit, async (req, res) => {
+  try {
+    const { audio, mimeType, size, language } = req.body;
+    if (!audio) return res.status(400).json({ error: 'No audio data' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
+
+    const audioBuf = Buffer.from(audio, 'base64');
+    if (audioBuf.length < 500) return res.json({ success: true, text: '' });
+
+    const mt = (mimeType || '').toLowerCase();
+    // iOS records as audio/mp4 (m4a) — MUST use .m4a extension or Whisper rejects it
+    // Android/Chrome records as audio/webm — use .webm
+    let ext, contentType;
+    if (mt.includes('mp4') || mt.includes('m4a') || mt.includes('aac') || mt.includes('x-m4a')) {
+      ext = 'm4a'; contentType = 'audio/mp4';
+    } else if (mt.includes('ogg')) {
+      ext = 'ogg'; contentType = 'audio/ogg';
+    } else if (mt.includes('wav')) {
+      ext = 'wav'; contentType = 'audio/wav';
+    } else if (mt.includes('mp3') || mt.includes('mpeg')) {
+      ext = 'mp3'; contentType = 'audio/mpeg';
+    } else {
+      // Default — webm works for Chrome/Firefox/Android
+      ext = 'webm'; contentType = 'audio/webm';
+    }
+
+    const boundary = 'MelisaBnd' + Date.now().toString(16);
+    const nl = '\r\n';
+
+    const parts = [
+      Buffer.from('--' + boundary + nl + 'Content-Disposition: form-data; name="model"' + nl + nl + 'whisper-1' + nl),
+      Buffer.from('--' + boundary + nl + 'Content-Disposition: form-data; name="response_format"' + nl + nl + 'json' + nl),
+    ];
+
+    // Add language hint if provided (helps accuracy)
+    if (language && language !== 'auto') {
+      parts.push(Buffer.from('--' + boundary + nl + 'Content-Disposition: form-data; name="language"' + nl + nl + language + nl));
+    }
+
+    parts.push(
+      Buffer.from('--' + boundary + nl +
+        'Content-Disposition: form-data; name="file"; filename="audio.' + ext + '"' + nl +
+        'Content-Type: ' + contentType + nl + nl),
+      audioBuf,
+      Buffer.from(nl + '--' + boundary + '--' + nl)
+    );
+
+    const body = Buffer.concat(parts);
+
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method:  'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type':  'multipart/form-data; boundary=' + boundary
+      },
+      body,
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(35000) } : {})
+    });
+
+    const raw = await whisperRes.text();
+    if (!whisperRes.ok) {
+      console.error('Whisper error:', raw.slice(0, 300));
+      return res.status(400).json({ error: 'Transcription failed. Please try again.' });
+    }
+
+    let text = '';
+    try { text = JSON.parse(raw).text || ''; } catch(e) { text = raw; }
+    console.log('🎙 Transcribed (' + audioBuf.length + 'B,' + ext + '):', text.slice(0, 80));
+    res.json({ success: true, text });
   } catch (e) {
-    res.status(500).json({ error: 'Failed' });
+    console.error('Transcribe error:', e.message);
+    res.status(500).json({ error: 'Transcription failed: ' + e.message });
   }
 });
 
-// Register new user
+// ── TTS (OpenAI) — Natural permanent voice ────────────────────
+app.post('/api/tts', ttsLimit, async (req, res) => {
+  try {
+    const { text, voice: reqVoice } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: 'No text' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'OpenAI key not configured' });
+
+    const safe = text
+      .replace(/<[^>]*>/g, '')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/[*_#`~>|]/g, '')
+      .replace(/\n{2,}/g, '. ')
+      .replace(/\n/g, ', ')
+      .trim()
+      .slice(0, 2000);
+
+    if (!safe) return res.status(400).json({ error: 'No text after cleaning' });
+
+    // shimmer = warm, natural, most human-sounding female voice
+    const voice = reqVoice || 'shimmer';
+
+    const r = await fetch('https://api.openai.com/v1/audio/speech', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({
+        model:           'tts-1-hd',   // high quality, natural voice
+        input:           safe,
+        voice:           voice,
+        response_format: 'mp3',
+        speed:           1.0           // natural pace
+      }),
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(30000) } : {})
+    });
+
+    if (!r.ok) {
+      const err = await r.text().catch(() => '');
+      console.error('OpenAI TTS error', r.status, err.slice(0, 200));
+      return res.status(r.status).json({ error: 'TTS failed' });
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    r.body.pipe(res);
+  } catch (e) {
+    console.error('TTS error:', e.message);
+    res.status(500).json({ error: 'TTS failed: ' + e.message });
+  }
+});
+
+// ── IMAGE GENERATION (DALL-E) ─────────────────────────────────
+app.post('/api/image', aiLimit, async (req, res) => {
+  try {
+    const { prompt, size } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'No prompt' });
+
+    const doc    = await getCfgDoc();
+    const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
+    if (!apiKey) return res.status(503).json({ error: 'AI not configured' });
+
+    const safePrompt = sanitize(prompt, 1000);
+    const validSizes = ['1024x1024', '1024x1792', '1792x1024'];
+    const safeSize   = validSizes.includes(size) ? size : '1792x1024';
+    const enhancedPrompt = safePrompt + '. Style: ultra HD 4K, cinematic lighting, hyper-detailed, professional digital art, vibrant colors, sharp focus';
+
+    const r = await fetch('https://api.openai.com/v1/images/generations', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({
+        model: 'dall-e-3', prompt: enhancedPrompt, n: 1,
+        size: safeSize, quality: 'hd', style: 'vivid', response_format: 'b64_json'
+      }),
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(90000) } : {})
+    });
+
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image gen failed' });
+
+    const dataUrl = `data:image/png;base64,${d.data[0].b64_json}`;
+    res.json({ success: true, url: dataUrl, revised_prompt: d.data[0].revised_prompt });
+  } catch (e) {
+    console.error('Image error:', e.message);
+    res.status(500).json({ error: 'Image generation failed: ' + e.message });
+  }
+});
+
+// ── LYRICS ─────────────────────────────────────────────────────
+app.get('/api/lyrics', aiLimit, async (req, res) => {
+  try {
+    const { artist, title } = req.query;
+    if (!title) return res.status(400).json({ error: 'title required' });
+
+    const safeTitle  = decodeURIComponent(title).trim();
+    const safeArtist = artist ? decodeURIComponent(artist).trim() : '';
+
+    // Source 0: lrclib direct GET (fastest)
+    if (safeArtist) {
+      try {
+        const dr = await fetch(
+          'https://lrclib.net/api/get?track_name=' + encodeURIComponent(safeTitle) +
+          '&artist_name=' + encodeURIComponent(safeArtist),
+          { headers: { 'User-Agent': 'MelisaAI/5.0' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}) }
+        );
+        if (dr.ok) {
+          const dd = await dr.json();
+          if (dd && dd.plainLyrics && dd.plainLyrics.length > 50)
+            return res.json({ success: true, lyrics: dd.plainLyrics.trim().slice(0, 10000),
+              trackName: dd.trackName || safeTitle, artistName: dd.artistName || safeArtist, source: 'lrclib' });
+        }
+      } catch (e) { console.warn('lrclib-direct:', e.message); }
+    }
+
+    // Source 1: lrclib search
+    try {
+      const q = 'https://lrclib.net/api/search?track_name=' + encodeURIComponent(safeTitle) +
+        (safeArtist ? '&artist_name=' + encodeURIComponent(safeArtist) : '');
+      const r = await fetch(q, { headers: { 'User-Agent': 'MelisaAI/5.0' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {}) });
+      if (r.ok) {
+        const results = await r.json();
+        let match = safeArtist
+          ? results.find(x => x.plainLyrics && x.artistName && x.artistName.toLowerCase().includes(safeArtist.toLowerCase()))
+          : null;
+        if (!match) match = results.find(x => x.plainLyrics && x.plainLyrics.length > 50);
+        if (match && match.plainLyrics)
+          return res.json({ success: true, lyrics: match.plainLyrics.trim().slice(0, 10000),
+            trackName: match.trackName || safeTitle, artistName: match.artistName || safeArtist, source: 'lrclib' });
+      }
+    } catch (e) { console.warn('lrclib-search:', e.message); }
+
+    // Source 2: lyrics.ovh
+    try {
+      const artistForOvh = safeArtist || safeTitle.split(' ')[0];
+      const ovhUrl = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artistForOvh) + '/' + encodeURIComponent(safeTitle);
+      const or = await fetch(ovhUrl, { ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}) });
+      if (or.ok) {
+        const od = await or.json();
+        if (od.lyrics && od.lyrics.length > 30)
+          return res.json({ success: true, lyrics: od.lyrics.trim().slice(0, 10000), trackName: safeTitle, artistName: safeArtist, source: 'ovh' });
+      }
+    } catch (e) { console.warn('lyrics.ovh:', e.message); }
+
+    // Source 3: Genius search via scrape (no key needed for basic titles)
+    try {
+      const geniusSearch = 'https://genius.com/api/search/multi?per_page=3&q=' + encodeURIComponent((safeArtist+' '+safeTitle).trim());
+      const gr = await fetch(geniusSearch, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' },
+        ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
+      });
+      if (gr.ok) {
+        const gd = await gr.json();
+        const sections = gd?.response?.sections || [];
+        const songSection = sections.find(s => s.type === 'song');
+        const hit = songSection?.hits?.[0]?.result;
+        if (hit) {
+          return res.json({ success: true,
+            lyrics: `Found on Genius: "${hit.full_title}"\n\nVisit: ${hit.url}\n\n(Full lyrics available on Genius.com)`,
+            trackName: hit.title, artistName: hit.primary_artist?.name || safeArtist, source: 'genius', url: hit.url });
+        }
+      }
+    } catch (e) { console.warn('genius:', e.message); }
+
+    res.status(404).json({ error: 'Lyrics not found. Try: "lyrics Blinding Lights by The Weeknd"' });
+  } catch (e) {
+    console.error('Lyrics error:', e.message);
+    res.status(500).json({ error: 'Lyrics lookup failed' });
+  }
+});
+
+// ── NEWS ───────────────────────────────────────────────────────
+app.get('/api/news', async (req, res) => {
+  const feeds = [
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://feeds.bbci.co.uk/news/technology/rss.xml',
+    'https://feeds.bbci.co.uk/news/business/rss.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
+    'https://feeds.reuters.com/reuters/topNews',
+  ];
+
+  for (const feedUrl of feeds.sort(() => Math.random() - 0.5)) {
+    try {
+      const r = await fetch(feedUrl, {
+        ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}),
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' }
+      });
+      if (!r.ok) continue;
+      const xml = await r.text();
+      const titles = [];
+      const titleRe = /<item[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
+      let m;
+      while ((m = titleRe.exec(xml)) !== null && titles.length < 10) {
+        const t = m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').trim();
+        if (t && t.length > 10) titles.push(t);
+      }
+      if (titles.length > 0) {
+        const headline = titles[Math.floor(Math.random() * Math.min(titles.length, 5))];
+        const source = feedUrl.includes('bbc') ? 'BBC' : feedUrl.includes('nytimes') ? 'NYT' : 'Reuters';
+        return res.json({ success: true, headline, source });
+      }
+    } catch (e) { continue; }
+  }
+  res.json({ success: false, headline: 'Live news temporarily unavailable' });
+});
+
+// ── REAL WEB SEARCH (DuckDuckGo — no API key needed) ──────────
+app.get('/api/search', aiLimit, async (req, res) => {
+  try {
+    const q = sanitize(req.query.q || '', 300);
+    if (!q) return res.status(400).json({ error: 'Query required' });
+
+    const ddgUrl = 'https://api.duckduckgo.com/?q=' + encodeURIComponent(q) + '&format=json&no_html=1&skip_disambig=1';
+    const r = await fetch(ddgUrl, {
+      headers: { 'User-Agent': 'MelisaAI/5.0' },
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {})
+    });
+    if (!r.ok) return res.json({ results: [] });
+    const d = await r.json();
+
+    const results = [];
+    if (d.Answer) results.push({ title: 'Direct answer', snippet: d.Answer, url: '' });
+    if (d.AbstractText) results.push({ title: d.Heading || q, snippet: d.AbstractText.slice(0, 400), url: d.AbstractURL });
+    if (Array.isArray(d.RelatedTopics)) {
+      d.RelatedTopics.slice(0, 6).forEach(t => {
+        if (t.Text) results.push({ title: t.FirstURL || '', snippet: t.Text.slice(0, 300), url: t.FirstURL });
+      });
+    }
+    res.json({ success: true, results: results.slice(0, 8) });
+  } catch (e) {
+    console.error('Search error:', e.message);
+    res.status(500).json({ results: [] });
+  }
+});
+
+// ── MEMORY API ────────────────────────────────────────────────
+app.post('/api/memory/save', async (req, res) => {
+  try {
+    const { email, memory } = req.body;
+    if (!email || !memory) return res.status(400).json({ error: 'Missing data' });
+    if (!db) return res.json({ success: true });
+    await db.collection('users').updateOne(
+      { email: sanitize(email, 200) },
+      { $set: { memory, memoryUpdated: Date.now() } }
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Memory save failed' }); }
+});
+
+app.get('/api/memory/load', async (req, res) => {
+  try {
+    const email = req.query.email;
+    if (!email || !db) return res.json({ success: true, memory: {} });
+    const user = await db.collection('users').findOne(
+      { email: decodeURIComponent(email) }, { projection: { memory: 1 } }
+    );
+    res.json({ success: true, memory: user?.memory || {} });
+  } catch (e) { res.status(500).json({ error: 'Memory load failed' }); }
+});
+
+// ── DOCUMENT READER ───────────────────────────────────────────
+app.post('/api/document', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL required' });
+    const safeUrl = sanitize(url, 500);
+    const r = await fetch(safeUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' },
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(12000) } : {})
+    });
+    if (!r.ok) return res.status(r.status).json({ error: 'Could not fetch URL' });
+    const html = await r.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ')
+      .replace(/\s{2,}/g, ' ').trim().slice(0, 15000);
+    res.json({ success: true, text, url: safeUrl });
+  } catch (e) {
+    res.status(500).json({ error: 'Document fetch failed: ' + e.message });
+  }
+});
+
+// ── USER MANAGEMENT ───────────────────────────────────────────
 app.post('/user/register', async (req, res) => {
   try {
     const { name, email, password, id, avatar, color } = req.body;
@@ -702,7 +776,7 @@ app.post('/user/register', async (req, res) => {
       id:       sanitize(id || 'u_' + Date.now(), 60),
       name:     sanitize(name, 100),
       email:    safeEmail,
-      password: hashPassword(password),  // store hashed
+      password: hashPassword(password),
       plan:     'free',
       created:  Date.now(),
       avatar:   sanitize(avatar || name[0].toUpperCase(), 5),
@@ -711,9 +785,7 @@ app.post('/user/register', async (req, res) => {
       lastSeen: Date.now()
     };
     await db.collection('users').insertOne(user);
-
     const { password: _pw, _id, ...safeUser } = user;
-    console.log('👤 New user registered:', safeEmail);
     res.json({ success: true, user: safeUser });
   } catch (e) {
     console.error('Register error:', e.message);
@@ -721,7 +793,6 @@ app.post('/user/register', async (req, res) => {
   }
 });
 
-// Login user
 app.post('/user/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -733,15 +804,11 @@ app.post('/user/login', async (req, res) => {
     if (!user) return res.status(401).json({ error: 'Invalid email or password' });
 
     const hashed = hashPassword(password);
-    // Also accept legacy frontend hash (starts with 'h') stored from old localStorage saves
     const legacyMatch = user.password && user.password === password;
-    if (user.password !== hashed && !legacyMatch) {
+    if (user.password !== hashed && !legacyMatch)
       return res.status(401).json({ error: 'Invalid email or password' });
-    }
 
-    // Update lastSeen
     await db.collection('users').updateOne({ email: safeEmail }, { $set: { lastSeen: Date.now() } });
-
     const { password: _pw, _id, ...safeUser } = user;
     res.json({ success: true, user: safeUser });
   } catch (e) {
@@ -750,7 +817,6 @@ app.post('/user/login', async (req, res) => {
   }
 });
 
-// Sync user
 app.post('/user/sync', async (req, res) => {
   try {
     const { user } = req.body;
@@ -771,12 +837,9 @@ app.post('/user/sync', async (req, res) => {
     };
     await db.collection('users').updateOne({ email }, { $set: safe }, { upsert: true });
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Sync failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Sync failed' }); }
 });
 
-// Get user
 app.get('/user/:email', async (req, res) => {
   try {
     if (!db) return res.status(404).json({ error: 'Not found' });
@@ -786,12 +849,10 @@ app.get('/user/:email', async (req, res) => {
     );
     if (!user) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true, user });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-// Create payment
+// ── PAYMENTS ──────────────────────────────────────────────────
 app.post('/create-payment', payLimit, async (req, res) => {
   try {
     const { amount, plan, plan_name, duration, email, phone, firstName, lastName, reference } = req.body;
@@ -837,7 +898,6 @@ app.post('/create-payment', payLimit, async (req, res) => {
       });
     }
 
-    console.log('💳 Payment:', ref, '$' + amt, safePlan, safeEmail);
     res.json({ success: true, redirect_url: od.redirect_url, order_tracking_id: od.order_tracking_id });
   } catch (e) {
     console.error('Payment error:', e.message);
@@ -845,7 +905,6 @@ app.post('/create-payment', payLimit, async (req, res) => {
   }
 });
 
-// Check payment
 app.get('/check-payment/:id', async (req, res) => {
   try {
     const { token, cfg } = await getPesapalToken();
@@ -862,15 +921,12 @@ app.get('/check-payment/:id', async (req, res) => {
       );
     }
     res.json({ success: true, paid, status: d.payment_status_description });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Pesapal webhook POST
 app.post('/pesapal-webhook', async (req, res) => {
   const { OrderTrackingId, OrderMerchantReference } = req.body;
-  console.log('💰 Payment confirmed:', OrderMerchantReference);
+  console.log('💰 Payment webhook:', OrderMerchantReference);
   try {
     if (db) {
       const tx = await db.collection('transactions').findOneAndUpdate(
@@ -887,13 +943,10 @@ app.post('/pesapal-webhook', async (req, res) => {
         );
       }
     }
-  } catch (e) {
-    console.error('Webhook error:', e.message);
-  }
+  } catch (e) { console.error('Webhook error:', e.message); }
   res.json({ orderNotificationType: 'IPNCHANGE', orderTrackingId: OrderTrackingId, orderMerchantReference: OrderMerchantReference, status: '200' });
 });
 
-// Pesapal webhook GET redirect
 app.get('/pesapal-webhook', async (req, res) => {
   const { OrderTrackingId, OrderMerchantReference } = req.query;
   const c = await getPesapalCfg();
@@ -905,65 +958,18 @@ app.get('/pesapal-webhook', async (req, res) => {
   res.redirect(c.appUrl + '?payment=success&ref=' + OrderMerchantReference + '&plan=' + plan + '&tracking=' + OrderTrackingId);
 });
 
-// Live news — fetch real RSS headlines server-side (no CORS issues)
-app.get('/api/news', async (req, res) => {
-  const feeds = [
-    'https://feeds.bbci.co.uk/news/world/rss.xml',
-    'https://feeds.bbci.co.uk/news/technology/rss.xml',
-    'https://feeds.bbci.co.uk/news/business/rss.xml',
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    'https://feeds.reuters.com/reuters/topNews',
-    'https://feeds.reuters.com/reuters/technologyNews',
-  ];
-
-  // Try each feed until one works
-  for (const feedUrl of feeds.sort(() => Math.random() - 0.5)) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6000);
-      const r = await fetch(feedUrl, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/1.0)' }
-      });
-      clearTimeout(timeout);
-      if (!r.ok) continue;
-
-      const xml = await r.text();
-      // Parse <item> titles from RSS XML
-      const titles = [];
-      const titleRe = /<item[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
-      let m;
-      while ((m = titleRe.exec(xml)) !== null && titles.length < 10) {
-        const t = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
-        if (t && t.length > 10) titles.push(t);
-      }
-
-      if (titles.length > 0) {
-        const headline = titles[Math.floor(Math.random() * Math.min(titles.length, 5))];
-        return res.json({ success: true, headline, source: feedUrl.includes('bbc') ? 'BBC' : 'Reuters' });
-      }
-    } catch (e) {
-      continue; // try next feed
-    }
-  }
-
-  res.json({ success: false, headline: 'Live news temporarily unavailable' });
-});
-
-// AzamPay endpoint
 app.post('/azampay', async (req, res) => {
-  res.status(503).json({ error: 'AzamPay not yet configured on this server' });
+  res.status(503).json({ error: 'AzamPay not yet configured' });
 });
 
-// ── SESSION STORAGE (permanent per Google account) ──────────────
+// ── SESSIONS ──────────────────────────────────────────────────
 app.post('/sessions/save', async (req, res) => {
   try {
     const { userId, email, sessions } = req.body;
     if (!email || !Array.isArray(sessions)) return res.status(400).json({ error: 'Invalid data' });
-    if (!db) return res.json({ success: true }); // no DB, silently ignore
+    if (!db) return res.json({ success: true });
 
     const safeEmail = sanitize(email, 200);
-    // Store up to 100 sessions per user — strip large content to save space
     const safeSessions = sessions.slice(0, 100).map(s => ({
       id:       sanitize(String(s.id || ''), 60),
       title:    sanitize(String(s.title || 'Chat'), 80),
@@ -984,7 +990,7 @@ app.post('/sessions/save', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('Sessions save error:', e.message);
-    res.json({ success: false }); // non-fatal — don't break client
+    res.json({ success: false });
   }
 });
 
@@ -993,46 +999,135 @@ app.get('/sessions/load', async (req, res) => {
     const { email } = req.query;
     if (!email) return res.status(400).json({ error: 'Email required' });
     if (!db) return res.json({ success: true, sessions: [] });
-
     const doc = await db.collection('sessions').findOne({ email: decodeURIComponent(email) });
     res.json({ success: true, sessions: doc?.sessions || [] });
   } catch (e) {
     console.error('Sessions load error:', e.message);
-    res.json({ success: true, sessions: [] }); // non-fatal
+    res.json({ success: true, sessions: [] });
   }
 });
 
-// 404
-// SPA fallback — serve index.html for any GET that isn't an API route
+// ── PUSH SUBSCRIPTIONS ────────────────────────────────────────
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, email, name } = req.body;
+    if (!subscription) return res.status(400).json({ error: 'No subscription' });
+    const sub = { subscription, email: sanitize(email || '', 200), name: sanitize(name || 'Friend', 100), created: Date.now() };
+    if (db) {
+      await db.collection('push_subs').updateOne(
+        { endpoint: subscription.endpoint },
+        { $set: sub },
+        { upsert: true }
+      );
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Subscribe failed' }); }
+});
+
+
+// ── VIDEO SEARCH (server-proxied to avoid browser CORS blocks) ────────
+app.get('/api/video-search', aiLimit, async (req, res) => {
+  try {
+    const q = sanitize(req.query.q || '', 200);
+    if (!q) return res.status(400).json({ error: 'Query required' });
+
+    // Try Piped API instances
+    const pipedInstances = [
+      'https://pipedapi.kavin.rocks',
+      'https://pipedapi.tokhmi.xyz',
+      'https://pipedapi.moomoo.me',
+      'https://piped-api.garudalinux.org',
+      'https://api.piped.projectsegfau.lt',
+    ];
+
+    for (const inst of pipedInstances) {
+      try {
+        const r = await fetch(inst + '/search?q=' + encodeURIComponent(q) + '&filter=music_songs', {
+          headers: { 'User-Agent': 'MelisaAI/5.0' },
+          ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
+        });
+        if (r.ok) {
+          const d = await r.json();
+          const item = d.items && d.items.find(i => i.type === 'stream' || i.url);
+          if (item && item.url) {
+            const videoId = item.url.replace('/watch?v=', '').split('&')[0];
+            return res.json({ success: true, videoId, title: item.title || q, source: 'piped' });
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Try Invidious
+    const invInstances = [
+      'https://inv.nadeko.net',
+      'https://invidious.privacydev.net',
+      'https://yt.artemislena.eu',
+      'https://invidious.flokinet.to',
+    ];
+
+    for (const inst of invInstances) {
+      try {
+        const r = await fetch(inst + '/api/v1/search?q=' + encodeURIComponent(q) + '&type=video&page=1', {
+          headers: { 'User-Agent': 'MelisaAI/5.0' },
+          ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (Array.isArray(d) && d[0] && d[0].videoId) {
+            return res.json({ success: true, videoId: d[0].videoId, title: d[0].title || q, source: 'invidious' });
+          }
+        }
+      } catch (e) {}
+    }
+
+    res.json({ success: false, videoId: null });
+  } catch (e) {
+    console.error('Video search error:', e.message);
+    res.status(500).json({ error: 'Video search failed' });
+  }
+});
+
+// ── SPA FALLBACK ──────────────────────────────────────────────
 app.use((req, res, next) => {
-  if (req.method === 'GET' && !req.path.startsWith('/api') && !req.path.startsWith('/admin') && !req.path.startsWith('/user') && !req.path.startsWith('/create-payment') && !req.path.startsWith('/check-payment') && !req.path.startsWith('/pesapal')) {
+  if (req.method === 'GET' &&
+      !req.path.startsWith('/api') &&
+      !req.path.startsWith('/admin') &&
+      !req.path.startsWith('/user') &&
+      !req.path.startsWith('/create-payment') &&
+      !req.path.startsWith('/check-payment') &&
+      !req.path.startsWith('/pesapal') &&
+      !req.path.startsWith('/sessions')) {
     const htmlFile = path.join(__dirname, 'index.html');
     if (fs.existsSync(htmlFile)) return res.sendFile(htmlFile);
+    const pubFile = path.join(__dirname, 'public', 'index.html');
+    if (fs.existsSync(pubFile)) return res.sendFile(pubFile);
   }
   res.status(404).json({ error: 'Not found' });
 });
 
-// Error handler
 app.use((err, req, res, next) => {
   console.error('Error:', err.message);
   res.status(500).json({ error: 'Server error' });
 });
 
-// Keep-alive ping — every 55s to prevent Render free-tier sleep (must be <90s)
+// ── KEEP-ALIVE: External ping every 4 min (prevents Render sleep) ──
 setInterval(() => {
-  fetch(SERVER_URL + '/ping').catch(() => {});
-}, 55 * 1000);
+  const pingUrl = (process.env.APP_SERVER_URL || SERVER_URL) + '/ping';
+  const fetchOpts = AbortSignal.timeout ? { signal: AbortSignal.timeout(10000) } : {};
+  fetch(pingUrl, fetchOpts)
+    .then(() => console.log('🏓 Keep-alive OK'))
+    .catch(e => console.warn('⚠️ Keep-alive failed:', e.message));
+}, 4 * 60 * 1000);
 
-// Start immediately — don't block on DB connection
+// ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('🚀 Melisa Server v4.0 — port ' + PORT);
-  console.log('🔒 Admin pass: ' + (ADMIN_PASS ? '✓ Set' : '✗ NOT SET'));
-  console.log('🤖 OpenAI: ' + (process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set'));
+  console.log('🚀 Melisa Server v5.0 — port ' + PORT);
+  console.log('🔒 Admin pass:', ADMIN_PASS ? '✓ Set' : '✗ NOT SET');
+  console.log('🤖 OpenAI:', process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set in env');
 });
 
-// Connect DB in background — server stays up even if DB is slow/unavailable
 connectDB().then(() => {
-  console.log('🍃 MongoDB: ' + (db ? '✓ Connected' : '✗ Not connected'));
+  console.log('🍃 MongoDB:', db ? '✓ Connected' : '✗ Not connected');
 }).catch(e => {
   console.error('🍃 MongoDB failed:', e.message);
 });
