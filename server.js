@@ -50,10 +50,14 @@ async function connectDB() {
         _id: 'settings',
         adminKeys: {},
         plans: {
-          student:    { monthly: 4.99,   half_year: 4.49,   yearly: 3.74   },
-          personal:   { monthly: 14.99,  half_year: 13.49,  yearly: 11.24  },
-          business:   { monthly: 49.99,  half_year: 44.99,  yearly: 37.49  },
-          enterprise: { monthly: 199.99, half_year: 179.99, yearly: 149.99 }
+          starter:      { monthly: 2.99,   half_year: 2.69,   yearly: 2.24   },
+          student:      { monthly: 4.99,   half_year: 4.49,   yearly: 3.74   },
+          personal:     { monthly: 14.99,  half_year: 13.49,  yearly: 11.24  },
+          creator:      { monthly: 24.99,  half_year: 22.49,  yearly: 18.74  },
+          pro:          { monthly: 34.99,  half_year: 31.49,  yearly: 26.24  },
+          business:     { monthly: 49.99,  half_year: 44.99,  yearly: 37.49  },
+          business_plus:{ monthly: 99.99,  half_year: 89.99,  yearly: 74.99  },
+          enterprise:   { monthly: 199.99, half_year: 179.99, yearly: 149.99 }
         }
       });
     }
@@ -226,6 +230,10 @@ app.get('/settings', async (req, res) => {
       plans: doc.plans || {},
       config: {
         openai_model:     k.model           || process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        announcement:     k.announcement    || '',
+        announcement_type:k.announcement_type||'info',
+        maintenance_mode: k.maintenance_mode|| '',
+        maintenance_msg:  k.maintenance_msg || '',
         paypal_me:        k.paypal_me        || '',
         lipa_mpesa:       k.lipa_mpesa       || '',
         lipa_tigo:        k.lipa_tigo        || '',
