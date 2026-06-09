@@ -1,4 +1,4 @@
-// MELISA AI — Secure Server v5.0 — Fixed & Production Ready
+// MELISA AI — Secure Server v5.1 — Updated for new UI
 'use strict';
 
 const express   = require('express');
@@ -62,7 +62,6 @@ async function connectDB() {
       });
     }
 
-    // Handle disconnections gracefully
     client.on('close', () => {
       console.warn('⚠️ MongoDB disconnected — will reconnect');
       db = null;
@@ -73,7 +72,7 @@ async function connectDB() {
     console.error('❌ MongoDB error:', e.message);
     db = null;
     mongoConnecting = false;
-    setTimeout(connectDB, 10000); // retry after 10s
+    setTimeout(connectDB, 10000);
   }
 }
 
@@ -199,7 +198,7 @@ app.use(express.static(__dirname));
 app.get('/health', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '✓ Melisa AI Server v5.0',
+    status:  '✓ Melisa AI Server v5.1',
     secure:  true,
     db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
     pesapal: c.key ? '✓ Configured' : '✗ Not configured',
@@ -277,7 +276,7 @@ app.post('/api/chat', aiLimit, async (req, res) => {
 
     const doc    = await getCfgDoc();
     const apiKey = doc.adminKeys.openai || process.env.OPENAI_API_KEY || '';
-    if (!apiKey) return res.status(503).json({ error: 'Melisa AI is not configured yet.' });
+    if (!apiKey) return res.status(503).json({ error: 'Melisa AI is not configured yet. Please add an OpenAI API key in Settings.' });
 
     const preferredModel = model || doc.adminKeys.model || 'gpt-4o-mini';
 
@@ -405,7 +404,6 @@ app.post('/admin/clear-revenue', adminLimit, async (req, res) => {
 });
 
 // ── VOICE TRANSCRIPTION (Whisper) ─────────────────────────────
-// Supports iOS (m4a/mp4) and Android (webm/ogg) — both work reliably
 app.post('/api/transcribe', aiLimit, async (req, res) => {
   try {
     const { audio, mimeType, size, language } = req.body;
@@ -419,8 +417,6 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
     if (audioBuf.length < 500) return res.json({ success: true, text: '' });
 
     const mt = (mimeType || '').toLowerCase();
-    // iOS records as audio/mp4 (m4a) — MUST use .m4a extension or Whisper rejects it
-    // Android/Chrome records as audio/webm — use .webm
     let ext, contentType;
     if (mt.includes('mp4') || mt.includes('m4a') || mt.includes('aac') || mt.includes('x-m4a')) {
       ext = 'm4a'; contentType = 'audio/mp4';
@@ -431,7 +427,6 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
     } else if (mt.includes('mp3') || mt.includes('mpeg')) {
       ext = 'mp3'; contentType = 'audio/mpeg';
     } else {
-      // Default — webm works for Chrome/Firefox/Android
       ext = 'webm'; contentType = 'audio/webm';
     }
 
@@ -443,7 +438,6 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
       Buffer.from('--' + boundary + nl + 'Content-Disposition: form-data; name="response_format"' + nl + nl + 'json' + nl),
     ];
 
-    // Add language hint if provided (helps accuracy)
     if (language && language !== 'auto') {
       parts.push(Buffer.from('--' + boundary + nl + 'Content-Disposition: form-data; name="language"' + nl + nl + language + nl));
     }
@@ -484,7 +478,7 @@ app.post('/api/transcribe', aiLimit, async (req, res) => {
   }
 });
 
-// ── TTS (OpenAI) — Natural permanent voice ────────────────────
+// ── TTS (OpenAI) ──────────────────────────────────────────────
 app.post('/api/tts', ttsLimit, async (req, res) => {
   try {
     const { text, voice: reqVoice } = req.body;
@@ -505,18 +499,17 @@ app.post('/api/tts', ttsLimit, async (req, res) => {
 
     if (!safe) return res.status(400).json({ error: 'No text after cleaning' });
 
-    // shimmer = warm, natural, most human-sounding female voice
     const voice = reqVoice || 'shimmer';
 
     const r = await fetch('https://api.openai.com/v1/audio/speech', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify({
-        model:           'tts-1-hd',   // high quality, natural voice
+        model:           'tts-1-hd',
         input:           safe,
         voice:           voice,
         response_format: 'mp3',
-        speed:           1.0           // natural pace
+        speed:           1.0
       }),
       ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(30000) } : {})
     });
@@ -538,6 +531,7 @@ app.post('/api/tts', ttsLimit, async (req, res) => {
 });
 
 // ── IMAGE GENERATION (DALL-E) ─────────────────────────────────
+// Returns { success, url, revised_prompt } — url is a data URI (base64 PNG)
 app.post('/api/image', aiLimit, async (req, res) => {
   try {
     const { prompt, size } = req.body;
@@ -565,6 +559,7 @@ app.post('/api/image', aiLimit, async (req, res) => {
     const d = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Image gen failed' });
 
+    // Return as data URI so the frontend can use it like a normal img src
     const dataUrl = `data:image/png;base64,${d.data[0].b64_json}`;
     res.json({ success: true, url: dataUrl, revised_prompt: d.data[0].revised_prompt });
   } catch (e) {
@@ -582,13 +577,12 @@ app.get('/api/lyrics', aiLimit, async (req, res) => {
     const safeTitle  = decodeURIComponent(title).trim();
     const safeArtist = artist ? decodeURIComponent(artist).trim() : '';
 
-    // Source 0: lrclib direct GET (fastest)
     if (safeArtist) {
       try {
         const dr = await fetch(
           'https://lrclib.net/api/get?track_name=' + encodeURIComponent(safeTitle) +
           '&artist_name=' + encodeURIComponent(safeArtist),
-          { headers: { 'User-Agent': 'MelisaAI/5.0' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}) }
+          { headers: { 'User-Agent': 'MelisaAI/5.1' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}) }
         );
         if (dr.ok) {
           const dd = await dr.json();
@@ -599,11 +593,10 @@ app.get('/api/lyrics', aiLimit, async (req, res) => {
       } catch (e) { console.warn('lrclib-direct:', e.message); }
     }
 
-    // Source 1: lrclib search
     try {
       const q = 'https://lrclib.net/api/search?track_name=' + encodeURIComponent(safeTitle) +
         (safeArtist ? '&artist_name=' + encodeURIComponent(safeArtist) : '');
-      const r = await fetch(q, { headers: { 'User-Agent': 'MelisaAI/5.0' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {}) });
+      const r = await fetch(q, { headers: { 'User-Agent': 'MelisaAI/5.1' }, ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {}) });
       if (r.ok) {
         const results = await r.json();
         let match = safeArtist
@@ -616,7 +609,6 @@ app.get('/api/lyrics', aiLimit, async (req, res) => {
       }
     } catch (e) { console.warn('lrclib-search:', e.message); }
 
-    // Source 2: lyrics.ovh
     try {
       const artistForOvh = safeArtist || safeTitle.split(' ')[0];
       const ovhUrl = 'https://api.lyrics.ovh/v1/' + encodeURIComponent(artistForOvh) + '/' + encodeURIComponent(safeTitle);
@@ -628,11 +620,10 @@ app.get('/api/lyrics', aiLimit, async (req, res) => {
       }
     } catch (e) { console.warn('lyrics.ovh:', e.message); }
 
-    // Source 3: Genius search via scrape (no key needed for basic titles)
     try {
       const geniusSearch = 'https://genius.com/api/search/multi?per_page=3&q=' + encodeURIComponent((safeArtist+' '+safeTitle).trim());
       const gr = await fetch(geniusSearch, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' },
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.1)' },
         ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
       });
       if (gr.ok) {
@@ -670,7 +661,7 @@ app.get('/api/news', async (req, res) => {
     try {
       const r = await fetch(feedUrl, {
         ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(7000) } : {}),
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.1)' }
       });
       if (!r.ok) continue;
       const xml = await r.text();
@@ -691,7 +682,7 @@ app.get('/api/news', async (req, res) => {
   res.json({ success: false, headline: 'Live news temporarily unavailable' });
 });
 
-// ── REAL WEB SEARCH (DuckDuckGo — no API key needed) ──────────
+// ── REAL WEB SEARCH (DuckDuckGo) ──────────────────────────────
 app.get('/api/search', aiLimit, async (req, res) => {
   try {
     const q = sanitize(req.query.q || '', 300);
@@ -699,7 +690,7 @@ app.get('/api/search', aiLimit, async (req, res) => {
 
     const ddgUrl = 'https://api.duckduckgo.com/?q=' + encodeURIComponent(q) + '&format=json&no_html=1&skip_disambig=1';
     const r = await fetch(ddgUrl, {
-      headers: { 'User-Agent': 'MelisaAI/5.0' },
+      headers: { 'User-Agent': 'MelisaAI/5.1' },
       ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {})
     });
     if (!r.ok) return res.json({ results: [] });
@@ -752,7 +743,7 @@ app.post('/api/document', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'URL required' });
     const safeUrl = sanitize(url, 500);
     const r = await fetch(safeUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.0)' },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.1)' },
       ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(12000) } : {})
     });
     if (!r.ok) return res.status(r.status).json({ error: 'Could not fetch URL' });
@@ -1032,14 +1023,12 @@ app.post('/api/push/subscribe', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Subscribe failed' }); }
 });
 
-
-// ── VIDEO SEARCH (server-proxied to avoid browser CORS blocks) ────────
+// ── VIDEO SEARCH ──────────────────────────────────────────────
 app.get('/api/video-search', aiLimit, async (req, res) => {
   try {
     const q = sanitize(req.query.q || '', 200);
     if (!q) return res.status(400).json({ error: 'Query required' });
 
-    // Try Piped API instances
     const pipedInstances = [
       'https://pipedapi.kavin.rocks',
       'https://pipedapi.tokhmi.xyz',
@@ -1051,7 +1040,7 @@ app.get('/api/video-search', aiLimit, async (req, res) => {
     for (const inst of pipedInstances) {
       try {
         const r = await fetch(inst + '/search?q=' + encodeURIComponent(q) + '&filter=music_songs', {
-          headers: { 'User-Agent': 'MelisaAI/5.0' },
+          headers: { 'User-Agent': 'MelisaAI/5.1' },
           ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
         });
         if (r.ok) {
@@ -1065,7 +1054,6 @@ app.get('/api/video-search', aiLimit, async (req, res) => {
       } catch (e) {}
     }
 
-    // Try Invidious
     const invInstances = [
       'https://inv.nadeko.net',
       'https://invidious.privacydev.net',
@@ -1076,7 +1064,7 @@ app.get('/api/video-search', aiLimit, async (req, res) => {
     for (const inst of invInstances) {
       try {
         const r = await fetch(inst + '/api/v1/search?q=' + encodeURIComponent(q) + '&type=video&page=1', {
-          headers: { 'User-Agent': 'MelisaAI/5.0' },
+          headers: { 'User-Agent': 'MelisaAI/5.1' },
           ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(6000) } : {})
         });
         if (r.ok) {
@@ -1118,7 +1106,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-// ── KEEP-ALIVE: External ping every 4 min (prevents Render sleep) ──
+// ── KEEP-ALIVE ────────────────────────────────────────────────
 setInterval(() => {
   const pingUrl = (process.env.APP_SERVER_URL || SERVER_URL) + '/ping';
   const fetchOpts = AbortSignal.timeout ? { signal: AbortSignal.timeout(10000) } : {};
@@ -1129,7 +1117,7 @@ setInterval(() => {
 
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('🚀 Melisa Server v5.0 — port ' + PORT);
+  console.log('🚀 Melisa Server v5.1 — port ' + PORT);
   console.log('🔒 Admin pass:', ADMIN_PASS ? '✓ Set' : '✗ NOT SET');
   console.log('🤖 OpenAI:', process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set in env');
 });
