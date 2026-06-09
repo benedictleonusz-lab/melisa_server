@@ -1,7 +1,7 @@
 {
   "name": "melisa-ai-server",
-  "version": "5.0.0",
-  "description": "Melisa AI — Server v5.0 (Fixed & Production Ready)",
+  "version": "5.1.0",
+  "description": "Melisa AI — Server v5.1 (Updated UI)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
