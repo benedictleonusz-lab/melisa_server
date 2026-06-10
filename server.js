@@ -505,9 +505,10 @@ app.post('/api/tts', ttsLimit, async (req, res) => {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify({
-        model:           'tts-1-hd',
+        model:           'gpt-4o-mini-tts',
         input:           safe,
         voice:           voice,
+        instructions:    'Speak in a warm, natural, conversational tone like a friendly 21-year-old woman talking to a close friend — relaxed pacing, light expressive inflection, not robotic or overly formal.',
         response_format: 'mp3',
         speed:           1.0
       }),
@@ -515,9 +516,30 @@ app.post('/api/tts', ttsLimit, async (req, res) => {
     });
 
     if (!r.ok) {
+      // Fallback to tts-1-hd if gpt-4o-mini-tts isn't available on this account
       const err = await r.text().catch(() => '');
-      console.error('OpenAI TTS error', r.status, err.slice(0, 200));
-      return res.status(r.status).json({ error: 'TTS failed' });
+      console.error('OpenAI TTS error (gpt-4o-mini-tts)', r.status, err.slice(0, 200));
+      const r2 = await fetch('https://api.openai.com/v1/audio/speech', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+        body: JSON.stringify({
+          model:           'tts-1-hd',
+          input:           safe,
+          voice:           voice,
+          response_format: 'mp3',
+          speed:           1.0
+        }),
+        ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(30000) } : {})
+      });
+      if (!r2.ok) {
+        const err2 = await r2.text().catch(() => '');
+        console.error('OpenAI TTS error (tts-1-hd)', r2.status, err2.slice(0, 200));
+        return res.status(r2.status).json({ error: 'TTS failed' });
+      }
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return r2.body.pipe(res);
     }
 
     res.setHeader('Content-Type', 'audio/mpeg');
