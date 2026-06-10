@@ -711,6 +711,41 @@ app.get('/api/search', aiLimit, async (req, res) => {
   }
 });
 
+// ── IMAGE SEARCH (DuckDuckGo Images) ──────────────────────────
+app.get('/api/image-search', aiLimit, async (req, res) => {
+  try {
+    const q = sanitize(req.query.q || '', 200);
+    if (!q) return res.status(400).json({ error: 'Query required' });
+
+    // DDG image search needs a vqd token from the html search page
+    const tokenRes = await fetch('https://duckduckgo.com/?q=' + encodeURIComponent(q), {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.1)' },
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {})
+    });
+    const tokenHtml = await tokenRes.text();
+    const vqdMatch = tokenHtml.match(/vqd=['"]?([\d-]+)['"]?/);
+    if (!vqdMatch) return res.json({ success: false, images: [] });
+    const vqd = vqdMatch[1];
+
+    const imgRes = await fetch(
+      `https://duckduckgo.com/i.js?q=${encodeURIComponent(q)}&vqd=${vqd}&f=,,,&p=1`,
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MelisaAI/5.1)', 'Referer': 'https://duckduckgo.com/' },
+        ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(8000) } : {})
+      }
+    );
+    if (!imgRes.ok) return res.json({ success: false, images: [] });
+    const imgData = await imgRes.json();
+    const images = (imgData.results || []).slice(0, 6).map(r => ({
+      url: r.image, thumbnail: r.thumbnail, title: r.title, source: r.url
+    }));
+    res.json({ success: true, images });
+  } catch (e) {
+    console.error('Image search error:', e.message);
+    res.json({ success: false, images: [] });
+  }
+});
+
 // ── MEMORY API ────────────────────────────────────────────────
 app.post('/api/memory/save', async (req, res) => {
   try {
