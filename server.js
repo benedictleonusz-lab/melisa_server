@@ -1,4 +1,4 @@
-// MELISA AI — Secure Server v5.1 — Updated for new UI
+// MELISA AI — Secure Server v5.2 — Synced with index.html v2
 'use strict';
 
 const express   = require('express');
@@ -198,7 +198,7 @@ app.use(express.static(__dirname));
 app.get('/health', async (req, res) => {
   const c = await getPesapalCfg();
   res.json({
-    status:  '✓ Melisa AI Server v5.1',
+    status:  '✓ Melisa AI Server v5.2',
     secure:  true,
     db:      db ? '✓ MongoDB Connected' : '✗ Not connected',
     pesapal: c.key ? '✓ Configured' : '✗ Not configured',
@@ -1180,7 +1180,7 @@ setInterval(() => {
 
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('🚀 Melisa Server v5.1 — port ' + PORT);
+  console.log('🚀 Melisa Server v5.2 — port ' + PORT);
   console.log('🔒 Admin pass:', ADMIN_PASS ? '✓ Set' : '✗ NOT SET');
   console.log('🤖 OpenAI:', process.env.OPENAI_API_KEY ? '✓ Set' : '✗ Not set in env');
 });
